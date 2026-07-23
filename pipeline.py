@@ -6,12 +6,15 @@ Approval model: nothing is written to Jira automatically, regardless of
 confidence score. Every claim with a resolved ticket match becomes a
 pending draft with an Approve/Skip button in Slack. The actual Jira write
 only happens when the consultant clicks Approve — see app.py's
-/slack/interactions endpoint for that half of the flow.
+/slack/interactions endpoint for that half of the flow. Leave and
+missing-hours selections are recorded but do not themselves write
+anywhere yet (no Tempo write-back built) — see README for what's real vs.
+recorded-only.
 """
 import logging
 import uuid
 
-from config import DEFAULT_JIRA_PROJECT
+from config import DEFAULT_JIRA_PROJECT, DAILY_TARGET_HOURS
 from clients import granola, claude, jira, slack, calendar, tempo
 import store
 
@@ -40,8 +43,6 @@ def run_for_consultant(consultant: dict, run_date: str, manual_notes: list[dict]
 
     for claim in claims:
         if claim["classification"] != "executed_work":
-            # Discussion / planning claims are never actionable as completed
-            # work — informational only, same as before.
             continue
 
         ticket_match = claim.get("ticket_match")
@@ -78,6 +79,7 @@ def run_for_consultant(consultant: dict, run_date: str, manual_notes: list[dict]
                 "claim_text": claim["claim_text"],
                 "suggested_hours": claim.get("suggested_hours", 0),
                 "confidence_score": claim["confidence_score"],
+                "source_timestamp": claim.get("source_timestamp"),
             }
         )
 
@@ -89,6 +91,15 @@ def run_for_consultant(consultant: dict, run_date: str, manual_notes: list[dict]
         if logged is not None or planned is not None:
             hours_summary = {"logged": logged, "planned": planned}
 
-    slack.send_review_message(consultant["slack_user_id"], name, run_date, drafted, informational, hours_summary)
+    slack.send_review_message(
+        consultant["slack_user_id"],
+        email,
+        name,
+        run_date,
+        drafted,
+        informational,
+        hours_summary=hours_summary,
+        target_hours=DAILY_TARGET_HOURS,
+    )
 
     return {"email": email, "drafted": drafted, "informational": informational}

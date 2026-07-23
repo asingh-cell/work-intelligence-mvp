@@ -20,6 +20,10 @@ SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET", "")
 TRIGGER_SHARED_SECRET = os.environ["TRIGGER_SHARED_SECRET"]
 AUTO_WRITE_THRESHOLD = int(os.environ.get("AUTO_WRITE_THRESHOLD", "85"))
 
+# Used to compute "missing hours" prompt in the Slack review — adjust to
+# whatever a normal working day means for your team.
+DAILY_TARGET_HOURS = float(os.environ.get("DAILY_TARGET_HOURS", "8"))
+
 # Optional: Tempo (planned vs logged hours). Leave blank to skip.
 TEMPO_API_TOKEN = os.environ.get("TEMPO_API_TOKEN", "")
 

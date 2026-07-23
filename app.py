@@ -71,8 +71,32 @@ def slack_interactions():
     payload = json.loads(parsed.get("payload", ["{}"])[0])
     action = (payload.get("actions") or [{}])[0]
     action_id = action.get("action_id")
-    draft_id = action.get("value")
     response_url = payload.get("response_url")
+
+    # Select-menu interactions (leave, missing-hours allocation) carry their
+    # context in the option value itself, not a draft_id — handle separately.
+    if action_id in ("leave_selection", "missing_hours_allocation"):
+        selected_value = (action.get("selected_option") or {}).get("value", "")
+        try:
+            consultant_email, run_date, choice = selected_value.split("::", 2)
+        except ValueError:
+            slack.ack_selection_via_response_url(response_url, "Couldn't read that selection — please try again.")
+            return "", 200
+
+        field = "leave" if action_id == "leave_selection" else "missing_hours_allocation"
+        store.save_day_meta(consultant_email, run_date, field, choice)
+
+        if field == "leave":
+            slack.ack_selection_via_response_url(response_url, f"Got it — leave recorded: {choice.replace('_', ' ')}.")
+        else:
+            slack.ack_selection_via_response_url(
+                response_url,
+                f"Got it — remaining hours logged as: {choice.replace('_', ' ')}. "
+                f"(Recorded internally — this doesn't push to Tempo yet, that's a future step.)",
+            )
+        return "", 200
+
+    draft_id = action.get("value")
 
     draft = store.get_draft(draft_id)
     if not draft:
