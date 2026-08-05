@@ -62,6 +62,18 @@ def test_add_hours_to_time():
     assert app.add_hours_to_time("garbage", 2) == "11:00"  # falls back to 09:00 start
 
 
+def test_time_options_and_rounding():
+    options = dict(app.TIME_OPTIONS)
+    assert options["00:00"] == "12:00 AM"
+    assert options["09:00"] == "9:00 AM"
+    assert options["12:00"] == "12:00 PM"
+    assert options["23:45"] == "11:45 PM"
+    assert len(app.TIME_OPTIONS) == 96  # 24h in 15-min steps, fits Slack's 100-option cap
+    assert app.nearest_time_slot("13:07") == "13:00"
+    assert app.nearest_time_slot("09:08") == "09:15"
+    assert app.nearest_time_slot("garbage") == "09:00"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in list(globals().items()) if k.startswith("test_")]
     for t in tests:

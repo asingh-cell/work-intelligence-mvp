@@ -541,21 +541,65 @@ def render_draft_blocks(draft: dict) -> list:
         ],
     })
 
+    has_unsynced = any(
+        item["status"] in ("approved", "edited") and not item.get("synced")
+        for item in draft["items"].values()
+    )
     blocks.append({"type": "divider"})
-    blocks.append({
-        "type": "actions",
-        "block_id": f"submit|{draft['id']}",
-        "elements": [
-            {"type": "button", "text": {"type": "plain_text", "text": "Submit to Jira"},
-             "style": "primary", "action_id": "submit_final", "value": draft["id"]},
-        ],
-    })
+    if has_unsynced:
+        blocks.append({
+            "type": "actions",
+            "block_id": f"submit|{draft['id']}",
+            "elements": [
+                {"type": "button",
+                 "text": {"type": "plain_text",
+                          "text": "Submit changes" if draft.get("submission_summary") else "Submit to Jira"},
+                 "style": "primary", "action_id": "submit_final", "value": draft["id"]},
+            ],
+        })
+    else:
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": "_Nothing new to submit — Edit, Undo, or add an entry above to send more._"},
+        })
     if draft.get("submission_summary"):
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": draft["submission_summary"]}})
     return blocks
 
 
 NO_TICKET_SENTINEL = "__NONE__"
+
+
+def _build_time_options():
+    options = []
+    for total_min in range(0, 24 * 60, 15):
+        h24, m = divmod(total_min, 60)
+        suffix = "AM" if h24 < 12 else "PM"
+        h12 = h24 % 12 or 12
+        options.append((f"{h24:02d}:{m:02d}", f"{h12}:{m:02d} {suffix}"))
+    return options
+
+
+TIME_OPTIONS = _build_time_options()  # 96 entries, 15-min increments, fits Slack's 100-option cap
+
+
+def nearest_time_slot(hhmm: str) -> str:
+    try:
+        h, m = (int(x) for x in hhmm.split(":"))
+    except ValueError:
+        h, m = 9, 0
+    snapped = (round((h * 60 + m) / 15) * 15) % (24 * 60)
+    return f"{snapped // 60:02d}:{snapped % 60:02d}"
+
+
+def time_select_block(block_id: str, label: str, current_value: str) -> dict:
+    options = [{"text": {"type": "plain_text", "text": lbl}, "value": val} for val, lbl in TIME_OPTIONS]
+    initial = next(o for o in options if o["value"] == nearest_time_slot(current_value))
+    return {
+        "type": "input", "block_id": block_id,
+        "label": {"type": "plain_text", "text": label},
+        "element": {"type": "static_select", "action_id": "value", "options": options, "initial_option": initial},
+    }
 
 
 def ticket_dropdown_block(ticket_options: list, initial_key: str = None) -> dict:
@@ -590,10 +634,8 @@ def edit_modal(draft_id, item_id, item, ticket_options=None):
                      "initial_value": item["description"]}},
         {"type": "input", "block_id": "hours", "label": {"type": "plain_text", "text": "Hours"},
          "element": {"type": "plain_text_input", "action_id": "value", "initial_value": str(item["hours"])}},
-        {"type": "input", "block_id": "start_time", "label": {"type": "plain_text", "text": "Start"},
-         "element": {"type": "timepicker", "action_id": "value", "initial_time": item["start_time"]}},
-        {"type": "input", "block_id": "end_time", "label": {"type": "plain_text", "text": "End"},
-         "element": {"type": "timepicker", "action_id": "value", "initial_time": item["end_time"]}},
+        time_select_block("start_time", "Start", item["start_time"]),
+        time_select_block("end_time", "End", item["end_time"]),
         {"type": "input", "block_id": "timezone", "label": {"type": "plain_text", "text": "Timezone"},
          "element": {"type": "static_select", "action_id": "value",
                      "initial_option": {"text": {"type": "plain_text", "text": item["timezone"]}, "value": item["timezone"]},
@@ -631,8 +673,7 @@ def manual_modal(draft_id, category_key, category_label, ticket_options=None):
          "element": {"type": "plain_text_input", "action_id": "value", "initial_value": category_label}},
         {"type": "input", "block_id": "description", "label": {"type": "plain_text", "text": "What did you do?"},
          "element": {"type": "plain_text_input", "action_id": "value", "multiline": True}},
-        {"type": "input", "block_id": "start_time", "label": {"type": "plain_text", "text": "Start time"},
-         "element": {"type": "timepicker", "action_id": "value", "initial_time": "09:00"}},
+        time_select_block("start_time", "Start time", "09:00"),
         {"type": "input", "block_id": "hours", "label": {"type": "plain_text", "text": "How many hours?"},
          "element": {"type": "plain_text_input", "action_id": "value"}},
         {"type": "input", "block_id": "timezone", "label": {"type": "plain_text", "text": "Timezone"},
@@ -713,6 +754,7 @@ def trigger():
             "timezone": DEFAULT_TZ,
             "status": "pending",
             "jira_worklog_id": None,
+            "synced": False,
         }
 
     draft = {
@@ -845,10 +887,11 @@ def _handle_interaction(payload):
                 item["ticket_summary"] = values["title"]["value"]["value"]
                 item["description"] = values["description"]["value"]["value"]
                 item["hours"] = float(values["hours"]["value"]["value"] or 0)
-                item["start_time"] = values["start_time"]["value"]["selected_time"]
-                item["end_time"] = values["end_time"]["value"]["selected_time"]
+                item["start_time"] = values["start_time"]["value"]["selected_option"]["value"]
+                item["end_time"] = values["end_time"]["value"]["selected_option"]["value"]
                 item["timezone"] = values["timezone"]["value"]["selected_option"]["value"]
                 item["status"] = "edited"
+                item["synced"] = False
                 update_draft_message(draft)
 
         elif callback_id == "manual_entry_submit":
@@ -858,7 +901,7 @@ def _handle_interaction(payload):
                 selected = values["ticket_key"]["value"]["selected_option"]["value"]
                 ticket_key = "N/A" if selected == NO_TICKET_SENTINEL else selected
                 hours = float(values["hours"]["value"]["value"] or 0)
-                start_time = values["start_time"]["value"]["selected_time"] or "09:00"
+                start_time = values["start_time"]["value"]["selected_option"]["value"]
                 item_id = new_item_id()
                 draft["items"][item_id] = {
                     "ticket_key": ticket_key,
@@ -872,6 +915,7 @@ def _handle_interaction(payload):
                     "status": "approved",
                     "source": "manual",
                     "jira_worklog_id": None,
+                    "synced": False,
                 }
                 update_draft_message(draft)
 
@@ -881,53 +925,48 @@ def _handle_interaction(payload):
 
 
 def submit_to_jira(draft):
-    results = []  # (ticket_key, ticket_summary, hours, ok, err, was_update)
+    results = []  # dicts: key, description, hours, ok, err
     for item in draft["items"].values():
         if item["status"] not in ("approved", "edited"):
             continue
         if item["ticket_key"] not in ALLOWED_TICKET_KEYS:
-            # no real ticket to log against (manual entry with "No ticket", or
-            # an unmatched Claude guess that was approved anyway) — record
-            # locally in the summary rather than sending a doomed Jira call
-            results.append((item["ticket_key"] or item["ticket_summary"], item["ticket_summary"],
-                             item["hours"], None, "no matching ticket, logged as note only", False))
+            # no real ticket to log against — nothing more to do with this one
+            # until it's edited to add one, so treat it as resolved for now
+            results.append({"key": item["ticket_key"] or item["ticket_summary"],
+                             "description": item["description"], "hours": item["hours"],
+                             "ok": None, "err": None})
+            item["synced"] = True
             continue
-        was_update = bool(item.get("jira_worklog_id"))
+        comment = (
+            f"{item['description']}\n\n"
+            f"(Logged as {item['start_time']}\u2013{item['end_time']} {item['timezone']}, {draft['date']} — "
+            f"if this displays at a different date/time here, check your Jira profile's Time zone setting.)"
+        )
         ok, err, worklog_id = jira_add_worklog(
-            item["ticket_key"], item["hours"], item["description"],
+            item["ticket_key"], item["hours"], comment,
             draft["date"], item["start_time"], item["timezone"],
             worklog_id=item.get("jira_worklog_id"),
         )
         if ok:
             item["jira_worklog_id"] = worklog_id
-        results.append((item["ticket_key"], item["ticket_summary"], item["hours"], ok, err, was_update))
+            item["synced"] = True
+        results.append({"key": item["ticket_key"], "description": item["description"],
+                         "hours": item["hours"], "ok": ok, "err": err})
 
-    # Tally per ticket (an item's hours can span multiple entries against the
-    # same ticket — this is the "what actually landed" total, not just a list)
-    totals = {}
-    for key, summary, hours, ok, err, _ in results:
-        if ok:
-            t = totals.setdefault(key, {"summary": summary, "hours": 0.0})
-            t["hours"] += hours
-
-    target = required_hours_for_leave(draft["leave_status"])
-    total_logged = sum(t["hours"] for t in totals.values())
-
-    lines = [f"*Last submitted:* {total_logged:.1f}h of {target:.1f}h target across {len(totals)} ticket(s)."]
-    for key, t in sorted(totals.items()):
-        link = f"<{JIRA_SITE}/browse/{key}|{key}>" if key not in ("N/A", "UNMATCHED") else key
-        lines.append(f"  • {link} — {t['summary']}: *{t['hours']:.1f}h*")
-    failed = [(k, h, e) for k, _, h, ok, e, _ in results if ok is False]
-    notes = [(k, h, e) for k, _, h, ok, e, _ in results if ok is None]
-    if failed:
-        lines.append("*Failed:*")
-        for k, h, e in failed:
-            lines.append(f"  • {k}: {h}h — {e}")
-    if notes:
-        lines.append("*Not logged to Jira (no ticket attached):*")
-        for k, h, e in notes:
-            lines.append(f"  • {k}: {h}h")
-    lines.append("_You can still Edit, Undo, or add more below, then hit Submit again — already-logged entries get updated, not duplicated._")
+    logged_now = sum(r["hours"] for r in results if r["ok"] is True)
+    lines = [f"*Last submitted:* {logged_now:.1f}h across {len(results)} entr{'y' if len(results) == 1 else 'ies'}."]
+    for r in results:
+        what = r["description"][:80] + ("…" if len(r["description"]) > 80 else "")
+        link = f"<{JIRA_SITE}/browse/{r['key']}|{r['key']}>" if r["key"] not in ("N/A", "UNMATCHED") else r["key"]
+        if r["ok"] is True:
+            lines.append(f"  • {link} — *{r['hours']}h* — {what}")
+        elif r["ok"] is False:
+            lines.append(f"  • {link} — {r['hours']}h — *failed*: {r['err']}")
+        else:
+            lines.append(f"  • {link} — {r['hours']}h — {what}  _(not logged — no ticket attached)_")
+    if not results:
+        lines.append("_Nothing new to submit this round._")
+    lines.append("_Edit, Undo, or add more below — Submit reappears once there's something new to send._")
 
     draft["submitted"] = True
     draft["submission_summary"] = "\n".join(lines)
