@@ -76,10 +76,14 @@ POST https://<your-render-url>/trigger
 Header: X-Trigger-Secret: <TRIGGER_SHARED_SECRET>
 Body (JSON):
 {
-  "slack_user_id": "U0123ABCD",
+  "email": "person@yourcompany.com",
   "date": "2026-08-04"
 }
 ```
+
+(You can pass `"slack_user_id": "U0123..."` instead of `email` if you already
+have it, but email is easier — you already know everyone's, no digging
+through Slack profile menus per person.)
 
 You should get a Slack DM from **Work Intelligence Assistant** within a few
 seconds. Click Approve/Edit/Skip on each item, set leave status if relevant,

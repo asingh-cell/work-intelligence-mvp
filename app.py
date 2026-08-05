@@ -102,6 +102,13 @@ def slack_api(method, **payload):
     return data
 
 
+def require_ok(resp: dict, context: str):
+    """Raise a clear error with Slack's actual reason instead of letting a
+    caller read a missing key and blow up with an opaque KeyError."""
+    if not resp.get("ok"):
+        raise RuntimeError(f"{context}: {resp.get('error', 'unknown error')}")
+
+
 def verify_slack_signature(req) -> bool:
     timestamp = req.headers.get("X-Slack-Request-Timestamp", "")
     try:
@@ -127,14 +134,10 @@ def fetch_person_messages(slack_user_id: str, target_date: str) -> list[dict]:
     for channel_id in SLACK_EVIDENCE_CHANNELS:
         cursor = None
         while True:
-            resp = slack_api(
-                "conversations.history",
-                channel=channel_id,
-                oldest=oldest,
-                latest=latest,
-                limit=200,
-                cursor=cursor,
-            )
+            kwargs = {"channel": channel_id, "oldest": oldest, "latest": latest, "limit": 200}
+            if cursor:
+                kwargs["cursor"] = cursor  # Slack rejects an explicit null cursor on the first page
+            resp = slack_api("conversations.history", **kwargs)
             if not resp.get("ok"):
                 break
             for msg in resp.get("messages", []):
@@ -156,7 +159,21 @@ def fetch_person_messages(slack_user_id: str, target_date: str) -> list[dict]:
 
 def open_dm(slack_user_id: str) -> str:
     resp = slack_api("conversations.open", users=slack_user_id)
+    require_ok(resp, "opening DM")
     return resp["channel"]["id"]
+
+
+def resolve_slack_user_id(email: str = None, slack_user_id: str = None) -> str:
+    """Accept either an email or a raw Slack user ID and return a Slack user ID.
+    Email is preferred — it's what you already have for everyone, no hunting
+    through Slack profile menus per person."""
+    if slack_user_id:
+        return slack_user_id.strip()
+    if email:
+        resp = slack_api("users.lookupByEmail", email=email.strip())
+        require_ok(resp, f"looking up Slack user for {email}")
+        return resp["user"]["id"]
+    raise RuntimeError("provide either 'email' or 'slack_user_id' in the request body")
 
 
 # ---------------------------------------------------------------------------
@@ -495,16 +512,20 @@ def health():
 
 @app.route("/trigger", methods=["POST"])
 def trigger():
-    """Postman calls this with: {"slack_user_id": "U0123", "date": "2026-08-04"}
+    """Postman calls this with: {"email": "person@company.com", "date": "2026-08-04"}
+    (or {"slack_user_id": "U0123", ...} if you already have it)
     Header: X-Trigger-Secret: <TRIGGER_SHARED_SECRET>"""
     if request.headers.get("X-Trigger-Secret") != TRIGGER_SHARED_SECRET:
         return jsonify(error="forbidden"), 403
 
     body = request.get_json(force=True, silent=True) or {}
-    slack_user_id = body.get("slack_user_id")
+    try:
+        slack_user_id = resolve_slack_user_id(
+            email=body.get("email"), slack_user_id=body.get("slack_user_id")
+        )
+    except RuntimeError as e:
+        return jsonify(error=str(e)), 400
     target_date = body.get("date") or date.today().isoformat()
-    if not slack_user_id:
-        return jsonify(error="slack_user_id is required"), 400
 
     try:
         messages = fetch_person_messages(slack_user_id, target_date)
@@ -543,15 +564,19 @@ def trigger():
         "submitted": False,
     }
 
-    dm_channel = open_dm(slack_user_id)
-    draft["channel"] = dm_channel
-    post = slack_api(
-        "chat.postMessage",
-        channel=dm_channel,
-        blocks=render_draft_blocks(draft),
-        text=f"Timesheet draft for {target_date}",
-    )
-    draft["ts"] = post.get("ts")
+    try:
+        dm_channel = open_dm(slack_user_id)
+        draft["channel"] = dm_channel
+        post = slack_api(
+            "chat.postMessage",
+            channel=dm_channel,
+            blocks=render_draft_blocks(draft),
+            text=f"Timesheet draft for {target_date}",
+        )
+        require_ok(post, "posting DM")
+    except RuntimeError as e:
+        return jsonify(error=str(e)), 502
+    draft["ts"] = post["ts"]
     PENDING[draft_id] = draft
 
     return jsonify(draft_id=draft_id, items_found=len(items)), 200
