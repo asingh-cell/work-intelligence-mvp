@@ -40,8 +40,8 @@ def test_logged_hours_only_counts_resolved_items():
             "b": {"status": "pending", "hours": 5.0},
             "c": {"status": "skipped", "hours": 1.0},
             "d": {"status": "edited", "hours": 1.5},
+            "e": {"status": "approved", "hours": 1.0, "source": "manual"},
         },
-        "manual_items": {"e": {"hours": 1.0}},
     }
     assert app.logged_hours(draft) == 4.5  # 2.0 + 1.5 + 1.0, pending/skipped excluded
 
@@ -51,6 +51,13 @@ def test_progress_bar_bounds():
     assert app.progress_bar(8, 8) == "🟩" * 10
     assert app.progress_bar(4, 8) == "🟩" * 5 + "⬜" * 5
     assert app.progress_bar(100, 8) == "🟩" * 10  # never overflows past full bar
+
+
+def test_add_hours_to_time():
+    assert app.add_hours_to_time("09:00", 1.5) == "10:30"
+    assert app.add_hours_to_time("09:00", 0) == "09:00"
+    assert app.add_hours_to_time("23:00", 5) == "23:59"  # clamps, doesn't roll to next day
+    assert app.add_hours_to_time("garbage", 2) == "11:00"  # falls back to 09:00 start
 
 
 if __name__ == "__main__":

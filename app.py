@@ -312,6 +312,18 @@ def jira_add_worklog(issue_key: str, hours: float, comment: str, target_date: st
 # ---------------------------------------------------------------------------
 # Business logic shared helpers (kept pure so they're easy to test — see test_app.py)
 # ---------------------------------------------------------------------------
+def add_hours_to_time(hhmm: str, hours: float) -> str:
+    """'14:30' + 1.5 -> '16:00'. ponytail: doesn't roll over past midnight
+    (clamps to 23:59) — fine for logging a single day's work, not meant for
+    overnight shifts."""
+    try:
+        h, m = (int(x) for x in hhmm.split(":"))
+    except ValueError:
+        h, m = 9, 0
+    total_minutes = min(h * 60 + m + round(hours * 60), 23 * 60 + 59)
+    return f"{total_minutes // 60:02d}:{total_minutes % 60:02d}"
+
+
 def required_hours_for_leave(leave_status: str) -> float:
     return {"full": 0.0, "half": DAILY_TARGET_HOURS / 2}.get(leave_status, DAILY_TARGET_HOURS)
 
@@ -325,13 +337,7 @@ def confidence_dot(confidence: float) -> str:
 
 
 def logged_hours(draft: dict) -> float:
-    total = 0.0
-    for item in draft["items"].values():
-        if item["status"] in ("approved", "edited"):
-            total += item["hours"]
-    for m in draft["manual_items"].values():
-        total += m["hours"]
-    return total
+    return sum(item["hours"] for item in draft["items"].values() if item["status"] in ("approved", "edited"))
 
 
 def progress_bar(logged: float, target: float, width: int = 10) -> str:
@@ -397,20 +403,24 @@ def render_draft_blocks(draft: dict) -> list:
             continue
 
         header = f"*{item['ticket_key']}* — {item['ticket_summary']}"
-        if item["ticket_key"] not in ALLOWED_TICKET_KEYS:
+        if item["ticket_key"] not in ALLOWED_TICKET_KEYS and item["ticket_key"] not in ("N/A", "UNMATCHED"):
             header += "  ⚠️ _not in your allowed ticket list — check before approving_"
 
         status_line = ""
         if item["status"] in ("approved", "edited"):
             status_line = "  ✅ *approved*" if item["status"] == "approved" else "  ✏️ *edited*"
 
+        confidence_line = (
+            "📝 manually logged" if item.get("source") == "manual"
+            else f"{confidence_dot(item['confidence'])} {item['confidence']:.0f}% confidence"
+        )
         blocks.append({
             "type": "section",
             "text": {
                 "type": "mrkdwn",
                 "text": (
                     f"{header}{status_line}\n"
-                    f"{item['hours']}h  {confidence_dot(item['confidence'])} {item['confidence']:.0f}% confidence\n"
+                    f"{item['hours']}h  {confidence_line}\n"
                     f"🕒 {item['start_time']} – {item['end_time']} {item['timezone']}, {draft['date']}\n"
                     f"{item['description']}"
                 ),
@@ -472,12 +482,6 @@ def render_draft_blocks(draft: dict) -> list:
             },
         ],
     })
-
-    for m_id, m in draft["manual_items"].items():
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"📝 *{m['category']}* — {m['description']}  ({m['hours']}h)"},
-        })
 
     blocks.append({"type": "divider"})
     blocks.append({
@@ -548,12 +552,10 @@ def manual_modal(draft_id, category_key, category_label, ticket_options=None):
         ticket_dropdown_block(ticket_options),
         {"type": "input", "block_id": "description", "label": {"type": "plain_text", "text": "What did you do?"},
          "element": {"type": "plain_text_input", "action_id": "value", "multiline": True}},
-        {"type": "input", "block_id": "hours", "label": {"type": "plain_text", "text": "Hours"},
+        {"type": "input", "block_id": "start_time", "label": {"type": "plain_text", "text": "Start time (HH:MM)"},
+         "element": {"type": "plain_text_input", "action_id": "value", "initial_value": "09:00"}},
+        {"type": "input", "block_id": "hours", "label": {"type": "plain_text", "text": "How many hours?"},
          "element": {"type": "plain_text_input", "action_id": "value"}},
-        {"type": "input", "block_id": "timezone", "label": {"type": "plain_text", "text": "Timezone"},
-         "element": {"type": "static_select", "action_id": "value",
-                     "initial_option": {"text": {"type": "plain_text", "text": DEFAULT_TZ}, "value": DEFAULT_TZ},
-                     "options": [{"text": {"type": "plain_text", "text": tz}, "value": tz} for tz in TIMEZONES]}},
     ]
     return {
         "type": "modal",
@@ -633,7 +635,6 @@ def trigger():
         "slack_user_id": slack_user_id,
         "date": target_date,
         "items": items,
-        "manual_items": {},
         "leave_status": "none",
         "submitted": False,
         "ticket_options": ticket_options,
@@ -750,14 +751,27 @@ def _handle_interaction(payload):
             draft_id, key, label = payload["view"]["private_metadata"].split("|")
             draft = PENDING.get(draft_id)
             if draft:
-                m_id = new_item_id()
                 selected = values["ticket_key"]["value"]["selected_option"]["value"]
-                draft["manual_items"][m_id] = {
-                    "category": label,
-                    "ticket_key": "N/A" if selected == NO_TICKET_SENTINEL else selected,
+                ticket_key = "N/A" if selected == NO_TICKET_SENTINEL else selected
+                hours = float(values["hours"]["value"]["value"] or 0)
+                start_time = values["start_time"]["value"]["value"] or "09:00"
+                ticket_summary = label
+                for t in draft.get("ticket_options") or []:
+                    if t["key"] == ticket_key:
+                        ticket_summary = t["summary"] or label
+                        break
+                item_id = new_item_id()
+                draft["items"][item_id] = {
+                    "ticket_key": ticket_key,
+                    "ticket_summary": ticket_summary,
                     "description": values["description"]["value"]["value"],
-                    "hours": float(values["hours"]["value"]["value"] or 0),
-                    "timezone": values["timezone"]["value"]["selected_option"]["value"],
+                    "hours": hours,
+                    "confidence": 100.0,
+                    "start_time": start_time,
+                    "end_time": add_hours_to_time(start_time, hours),
+                    "timezone": DEFAULT_TZ,
+                    "status": "approved",
+                    "source": "manual",
                 }
                 update_draft_message(draft)
 
@@ -771,22 +785,18 @@ def submit_to_jira(draft):
     for item in draft["items"].values():
         if item["status"] not in ("approved", "edited"):
             continue
+        if item["ticket_key"] not in ALLOWED_TICKET_KEYS:
+            # no real ticket to log against (manual entry with "No ticket", or
+            # an unmatched Claude guess that was approved anyway) — record
+            # locally in the summary rather than sending a doomed Jira call
+            results.append((item["ticket_key"] or item["ticket_summary"], item["hours"], None,
+                             "no matching ticket, logged as note only"))
+            continue
         ok, err = jira_add_worklog(
             item["ticket_key"], item["hours"], item["description"],
             draft["date"], item["start_time"], item["timezone"],
         )
         results.append((item["ticket_key"], item["hours"], ok, err))
-
-    for m in draft["manual_items"].values():
-        if m["ticket_key"] and m["ticket_key"] != "N/A" and m["ticket_key"].upper() in ALLOWED_TICKET_KEYS:
-            ok, err = jira_add_worklog(
-                m["ticket_key"], m["hours"], f"[{m['category']}] {m['description']}",
-                draft["date"], "09:00", m["timezone"],
-            )
-            results.append((m["ticket_key"] or m["category"], m["hours"], ok, err))
-        else:
-            # no valid ticket to log against — record locally only
-            results.append((m["category"], m["hours"], None, "no matching ticket, logged as note only"))
 
     draft["submitted"] = True
     lines = ["✅ *Submitted.*"]
