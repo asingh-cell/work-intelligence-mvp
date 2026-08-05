@@ -267,10 +267,16 @@ def extract_timesheet_items(messages: list[dict], target_date: str) -> list[dict
 
     resp = claude.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=2000,
+        max_tokens=8000,
         messages=[{"role": "user", "content": prompt}],
     )
     raw = "".join(block.text for block in resp.content if block.type == "text").strip()
+    if not raw:
+        log.error(
+            "Claude returned no usable text — stop_reason=%s, block types=%s. "
+            "If stop_reason is 'max_tokens', the response got cut off before finishing.",
+            resp.stop_reason, [b.type for b in resp.content],
+        )
     return parse_claude_json(raw)
 
 
