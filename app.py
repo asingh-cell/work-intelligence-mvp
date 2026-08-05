@@ -157,15 +157,6 @@ def fetch_person_messages(slack_user_id: str, target_date: str) -> list[dict]:
     return collected
 
 
-def get_slack_user_email(slack_user_id: str) -> str | None:
-    """Best-effort — returns None (not raise) since this only feeds the
-    optional Jira ticket-picker dropdown, not the core trigger flow."""
-    resp = slack_api("users.info", user=slack_user_id)
-    if not resp.get("ok"):
-        return None
-    return resp.get("user", {}).get("profile", {}).get("email")
-
-
 def open_dm(slack_user_id: str) -> str:
     resp = slack_api("conversations.open", users=slack_user_id)
     require_ok(resp, "opening DM")
@@ -268,39 +259,26 @@ def jira_auth():
     return (JIRA_EMAIL, JIRA_API_TOKEN)
 
 
-def jira_get_assigned_tickets(email: str, max_results: int = 20) -> list[dict]:
-    """Tickets currently assigned to this person, for the edit/manual-entry
-    dropdowns. Returns [] on any failure — this is a convenience list, not
-    something that should block the trigger if Jira hiccups."""
-    try:
-        who = requests.get(
-            f"{JIRA_SITE}/rest/api/3/user/search",
-            auth=jira_auth(), params={"query": email}, timeout=15,
-        )
-        who.raise_for_status()
-        matches = [u for u in who.json() if u.get("emailAddress", "").lower() == email.lower()]
-        if not matches:
-            return []
-        account_id = matches[0]["accountId"]
-
-        search = requests.get(
-            f"{JIRA_SITE}/rest/api/3/search",
-            auth=jira_auth(),
-            params={
-                "jql": f'assignee="{account_id}" ORDER BY updated DESC',
-                "maxResults": max_results,
-                "fields": "summary",
-            },
-            timeout=15,
-        )
-        search.raise_for_status()
-        return [
-            {"key": issue["key"], "summary": issue["fields"]["summary"]}
-            for issue in search.json().get("issues", [])
-        ]
-    except requests.RequestException as e:
-        log.error("jira_get_assigned_tickets failed for %s: %s", email, e)
-        return []
+def jira_get_ticket_options(keys: set) -> list[dict]:
+    """Dropdown options built from your ALLOWED_TICKET_KEYS, with live
+    summaries pulled from Jira. Add a ticket to ALLOWED_TICKET_KEYS in Render
+    and it shows up here automatically — no code change needed. Best-effort
+    per ticket: a summary fetch failure just shows the key with no summary
+    rather than dropping the ticket from the list."""
+    options = []
+    for key in sorted(keys):
+        summary = ""
+        try:
+            resp = requests.get(
+                f"{JIRA_SITE}/rest/api/3/issue/{key}",
+                auth=jira_auth(), params={"fields": "summary"}, timeout=10,
+            )
+            if resp.status_code < 300:
+                summary = resp.json().get("fields", {}).get("summary", "")
+        except requests.RequestException as e:
+            log.error("jira_get_ticket_options: couldn't fetch %s: %s", key, e)
+        options.append({"key": key, "summary": summary})
+    return options
 
 
 def jira_add_worklog(issue_key: str, hours: float, comment: str, target_date: str,
@@ -516,21 +494,21 @@ def render_draft_blocks(draft: dict) -> list:
 NO_TICKET_SENTINEL = "__NONE__"
 
 
-def assigned_ticket_dropdown_block(assigned_tickets: list, initial_key: str = None) -> dict:
-    """Dropdown of the person's currently-assigned Jira tickets, always with
-    a 'no ticket' fallback first so the UI is consistent even when the Jira
-    lookup found nothing (wrong permissions, nothing assigned yet, etc.) —
-    the person can still type a key by hand in that case."""
-    assigned_tickets = assigned_tickets or []
+def ticket_dropdown_block(ticket_options: list, initial_key: str = None) -> dict:
+    """The sole ticket-selection control in the edit/manual-entry modals —
+    sourced from ALLOWED_TICKET_KEYS (add a ticket there and it shows up
+    here automatically), with a 'no ticket' fallback always available."""
+    ticket_options = ticket_options or []
     options = [
-        {"text": {"type": "plain_text", "text": "🚫 No ticket / I'll type it below"}, "value": NO_TICKET_SENTINEL},
+        {"text": {"type": "plain_text", "text": "🚫 No ticket"}, "value": NO_TICKET_SENTINEL},
     ] + [
-        {"text": {"type": "plain_text", "text": f"{t['key']} — {t['summary']}"[:75]}, "value": t["key"]}
-        for t in assigned_tickets[:99]  # Slack's static_select option limit is 100
+        {"text": {"type": "plain_text", "text": f"{t['key']} — {t['summary']}"[:75] if t["summary"] else t["key"]},
+         "value": t["key"]}
+        for t in ticket_options[:99]  # Slack's static_select option limit is 100
     ]
     block = {
-        "type": "input", "block_id": "assigned_ticket", "optional": True,
-        "label": {"type": "plain_text", "text": "Pick from your assigned tickets (or type one below)"},
+        "type": "input", "block_id": "ticket_key",
+        "label": {"type": "plain_text", "text": "Ticket"},
         "element": {"type": "static_select", "action_id": "value", "options": options},
     }
     match = next((o for o in options if o["value"] == initial_key), options[0])
@@ -538,15 +516,9 @@ def assigned_ticket_dropdown_block(assigned_tickets: list, initial_key: str = No
     return block
 
 
-def edit_modal(draft_id, item_id, item, assigned_tickets=None):
+def edit_modal(draft_id, item_id, item, ticket_options=None):
     blocks = [
-        {"type": "input", "block_id": "ticket_key", "label": {"type": "plain_text", "text": "Ticket key"},
-         "element": {"type": "plain_text_input", "action_id": "value", "initial_value": item["ticket_key"]}},
-    ]
-    dropdown = assigned_ticket_dropdown_block(assigned_tickets, initial_key=item["ticket_key"])
-    if dropdown:
-        blocks.append(dropdown)
-    blocks += [
+        ticket_dropdown_block(ticket_options, initial_key=item["ticket_key"]),
         {"type": "input", "block_id": "description", "label": {"type": "plain_text", "text": "Description"},
          "element": {"type": "plain_text_input", "action_id": "value", "multiline": True,
                      "initial_value": item["description"]}},
@@ -571,16 +543,9 @@ def edit_modal(draft_id, item_id, item, assigned_tickets=None):
     }
 
 
-def manual_modal(draft_id, category_key, category_label, assigned_tickets=None):
+def manual_modal(draft_id, category_key, category_label, ticket_options=None):
     blocks = [
-        {"type": "input", "block_id": "ticket_key", "optional": True,
-         "label": {"type": "plain_text", "text": "Ticket key (optional)"},
-         "element": {"type": "plain_text_input", "action_id": "value"}},
-    ]
-    dropdown = assigned_ticket_dropdown_block(assigned_tickets)
-    if dropdown:
-        blocks.append(dropdown)
-    blocks += [
+        ticket_dropdown_block(ticket_options),
         {"type": "input", "block_id": "description", "label": {"type": "plain_text", "text": "What did you do?"},
          "element": {"type": "plain_text_input", "action_id": "value", "multiline": True}},
         {"type": "input", "block_id": "hours", "label": {"type": "plain_text", "text": "Hours"},
@@ -634,8 +599,7 @@ def trigger():
     except RuntimeError as e:
         return jsonify(error=str(e)), 400
     target_date = body.get("date") or date.today().isoformat()
-    email = body.get("email") or get_slack_user_email(slack_user_id)
-    assigned_tickets = jira_get_assigned_tickets(email) if email else []
+    ticket_options = jira_get_ticket_options(ALLOWED_TICKET_KEYS)
 
     try:
         messages = fetch_person_messages(slack_user_id, target_date)
@@ -672,7 +636,7 @@ def trigger():
         "manual_items": {},
         "leave_status": "none",
         "submitted": False,
-        "assigned_tickets": assigned_tickets,
+        "ticket_options": ticket_options,
     }
 
     try:
@@ -737,7 +701,7 @@ def _handle_interaction(payload):
             if draft:
                 slack_api("views.open", trigger_id=trigger_id,
                           view=edit_modal(draft_id, item_id, draft["items"][item_id],
-                                          assigned_tickets=draft.get("assigned_tickets")))
+                                          ticket_options=draft.get("ticket_options")))
 
         elif action_id == "leave_status":
             draft_id = payload["actions"][0]["block_id"].split("|")[1]
@@ -753,7 +717,7 @@ def _handle_interaction(payload):
             draft = PENDING.get(draft_id)
             slack_api("views.open", trigger_id=trigger_id,
                       view=manual_modal(draft_id, key, label,
-                                        assigned_tickets=draft.get("assigned_tickets") if draft else None))
+                                        ticket_options=draft.get("ticket_options") if draft else None))
 
         elif action_id == "submit_final":
             draft_id = action["value"]
@@ -772,9 +736,8 @@ def _handle_interaction(payload):
             draft = PENDING.get(draft_id)
             if draft:
                 item = draft["items"][item_id]
-                picked = values.get("assigned_ticket", {}).get("value", {}).get("selected_option")
-                typed = values["ticket_key"]["value"]["value"]
-                item["ticket_key"] = ((picked["value"] if picked and picked["value"] != NO_TICKET_SENTINEL else typed) or "UNMATCHED").upper()
+                selected = values["ticket_key"]["value"]["selected_option"]["value"]
+                item["ticket_key"] = "UNMATCHED" if selected == NO_TICKET_SENTINEL else selected
                 item["description"] = values["description"]["value"]["value"]
                 item["hours"] = float(values["hours"]["value"]["value"] or 0)
                 item["start_time"] = values["start_time"]["value"]["value"]
@@ -788,11 +751,10 @@ def _handle_interaction(payload):
             draft = PENDING.get(draft_id)
             if draft:
                 m_id = new_item_id()
-                picked = values.get("assigned_ticket", {}).get("value", {}).get("selected_option")
-                typed = values["ticket_key"]["value"]["value"]
+                selected = values["ticket_key"]["value"]["selected_option"]["value"]
                 draft["manual_items"][m_id] = {
                     "category": label,
-                    "ticket_key": (picked["value"] if picked and picked["value"] != NO_TICKET_SENTINEL else typed) or "N/A",
+                    "ticket_key": "N/A" if selected == NO_TICKET_SENTINEL else selected,
                     "description": values["description"]["value"]["value"],
                     "hours": float(values["hours"]["value"]["value"] or 0),
                     "timezone": values["timezone"]["value"]["selected_option"]["value"],
