@@ -1,0 +1,25 @@
+display_information:
+  name: Work Intelligence Assistant
+  description: Drafts your Jira timesheet from Slack activity for you to approve.
+features:
+  bot_user:
+    display_name: Work Intelligence Assistant
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - im:write
+      - channels:history
+      - groups:history
+      - channels:read
+      - groups:read
+settings:
+  interactivity:
+    is_enabled: true
+    # Replace with your real Render URL once deployed, e.g.
+    # https://work-intelligence-mvp.onrender.com/slack/interactions
+    request_url: https://REPLACE-ME.onrender.com/slack/interactions
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false
