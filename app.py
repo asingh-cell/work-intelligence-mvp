@@ -70,9 +70,9 @@ DAILY_TARGET_HOURS = 8.0
 # India team (transcript says US/Central come later) — when it expands, swap
 # for zoneinfo with real IANA tz names (Asia/Kolkata, America/New_York, ...).
 TIMEZONES = {
-    "IST": "+05:30",
-    "EST": "-05:00",
-    "CST": "-06:00",
+    "IST": "+0530",
+    "EST": "-0500",
+    "CST": "-0600",
 }
 DEFAULT_TZ = "IST"
 
@@ -155,6 +155,15 @@ def fetch_person_messages(slack_user_id: str, target_date: str) -> list[dict]:
             if not cursor:
                 break
     return collected
+
+
+def get_slack_user_email(slack_user_id: str) -> str | None:
+    """Best-effort — returns None (not raise) since this only feeds the
+    optional Jira ticket-picker dropdown, not the core trigger flow."""
+    resp = slack_api("users.info", user=slack_user_id)
+    if not resp.get("ok"):
+        return None
+    return resp.get("user", {}).get("profile", {}).get("email")
 
 
 def open_dm(slack_user_id: str) -> str:
@@ -257,6 +266,41 @@ def parse_claude_json(raw: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 def jira_auth():
     return (JIRA_EMAIL, JIRA_API_TOKEN)
+
+
+def jira_get_assigned_tickets(email: str, max_results: int = 20) -> list[dict]:
+    """Tickets currently assigned to this person, for the edit/manual-entry
+    dropdowns. Returns [] on any failure — this is a convenience list, not
+    something that should block the trigger if Jira hiccups."""
+    try:
+        who = requests.get(
+            f"{JIRA_SITE}/rest/api/3/user/search",
+            auth=jira_auth(), params={"query": email}, timeout=15,
+        )
+        who.raise_for_status()
+        matches = [u for u in who.json() if u.get("emailAddress", "").lower() == email.lower()]
+        if not matches:
+            return []
+        account_id = matches[0]["accountId"]
+
+        search = requests.get(
+            f"{JIRA_SITE}/rest/api/3/search",
+            auth=jira_auth(),
+            params={
+                "jql": f'assignee="{account_id}" ORDER BY updated DESC',
+                "maxResults": max_results,
+                "fields": "summary",
+            },
+            timeout=15,
+        )
+        search.raise_for_status()
+        return [
+            {"key": issue["key"], "summary": issue["fields"]["summary"]}
+            for issue in search.json().get("issues", [])
+        ]
+    except requests.RequestException as e:
+        log.error("jira_get_assigned_tickets failed for %s: %s", email, e)
+        return []
 
 
 def jira_add_worklog(issue_key: str, hours: float, comment: str, target_date: str,
@@ -364,6 +408,14 @@ def render_draft_blocks(draft: dict) -> list:
                 "type": "section",
                 "text": {"type": "mrkdwn", "text": f"~{item['ticket_key']} — {item['ticket_summary']}~  ⏭ _skipped_"},
             })
+            blocks.append({
+                "type": "actions",
+                "block_id": f"item_actions|{draft['id']}|{item_id}",
+                "elements": [
+                    {"type": "button", "text": {"type": "plain_text", "text": "↩️ Undo"},
+                     "action_id": "undo_item", "value": f"{draft['id']}|{item_id}"},
+                ],
+            })
             continue
 
         header = f"*{item['ticket_key']}* — {item['ticket_summary']}"
@@ -397,6 +449,17 @@ def render_draft_blocks(draft: dict) -> list:
                      "action_id": "edit_item", "value": f"{draft['id']}|{item_id}"},
                     {"type": "button", "text": {"type": "plain_text", "text": "⏭ Skip"},
                      "style": "danger", "action_id": "skip_item", "value": f"{draft['id']}|{item_id}"},
+                ],
+            })
+        else:
+            blocks.append({
+                "type": "actions",
+                "block_id": f"item_actions|{draft['id']}|{item_id}",
+                "elements": [
+                    {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"},
+                     "action_id": "edit_item", "value": f"{draft['id']}|{item_id}"},
+                    {"type": "button", "text": {"type": "plain_text", "text": "↩️ Undo"},
+                     "action_id": "undo_item", "value": f"{draft['id']}|{item_id}"},
                 ],
             })
 
@@ -450,53 +513,86 @@ def render_draft_blocks(draft: dict) -> list:
     return blocks
 
 
-def edit_modal(draft_id, item_id, item):
+def assigned_ticket_dropdown_block(assigned_tickets: list, initial_key: str = None) -> dict | None:
+    """Optional dropdown of the person's currently-assigned Jira tickets.
+    Returns None when we have no list (Jira lookup failed or found nothing) —
+    callers fall back to the free-text ticket_key field in that case."""
+    if not assigned_tickets:
+        return None
+    options = [
+        {"text": {"type": "plain_text", "text": f"{t['key']} — {t['summary']}"[:75]}, "value": t["key"]}
+        for t in assigned_tickets[:100]  # Slack's static_select option limit
+    ]
+    block = {
+        "type": "input", "block_id": "assigned_ticket", "optional": True,
+        "label": {"type": "plain_text", "text": "Or pick from your assigned tickets"},
+        "element": {"type": "static_select", "action_id": "value", "options": options},
+    }
+    match = next((o for o in options if o["value"] == initial_key), None)
+    if match:
+        block["element"]["initial_option"] = match
+    return block
+
+
+def edit_modal(draft_id, item_id, item, assigned_tickets=None):
+    blocks = [
+        {"type": "input", "block_id": "ticket_key", "label": {"type": "plain_text", "text": "Ticket key"},
+         "element": {"type": "plain_text_input", "action_id": "value", "initial_value": item["ticket_key"]}},
+    ]
+    dropdown = assigned_ticket_dropdown_block(assigned_tickets, initial_key=item["ticket_key"])
+    if dropdown:
+        blocks.append(dropdown)
+    blocks += [
+        {"type": "input", "block_id": "description", "label": {"type": "plain_text", "text": "Description"},
+         "element": {"type": "plain_text_input", "action_id": "value", "multiline": True,
+                     "initial_value": item["description"]}},
+        {"type": "input", "block_id": "hours", "label": {"type": "plain_text", "text": "Hours"},
+         "element": {"type": "plain_text_input", "action_id": "value", "initial_value": str(item["hours"])}},
+        {"type": "input", "block_id": "start_time", "label": {"type": "plain_text", "text": "Start (HH:MM)"},
+         "element": {"type": "plain_text_input", "action_id": "value", "initial_value": item["start_time"]}},
+        {"type": "input", "block_id": "end_time", "label": {"type": "plain_text", "text": "End (HH:MM)"},
+         "element": {"type": "plain_text_input", "action_id": "value", "initial_value": item["end_time"]}},
+        {"type": "input", "block_id": "timezone", "label": {"type": "plain_text", "text": "Timezone"},
+         "element": {"type": "static_select", "action_id": "value",
+                     "initial_option": {"text": {"type": "plain_text", "text": item["timezone"]}, "value": item["timezone"]},
+                     "options": [{"text": {"type": "plain_text", "text": tz}, "value": tz} for tz in TIMEZONES]}},
+    ]
     return {
         "type": "modal",
         "callback_id": "edit_item_submit",
         "private_metadata": f"{draft_id}|{item_id}",
         "title": {"type": "plain_text", "text": "Edit entry"},
         "submit": {"type": "plain_text", "text": "Save"},
-        "blocks": [
-            {"type": "input", "block_id": "ticket_key", "label": {"type": "plain_text", "text": "Ticket key"},
-             "element": {"type": "plain_text_input", "action_id": "value", "initial_value": item["ticket_key"]}},
-            {"type": "input", "block_id": "description", "label": {"type": "plain_text", "text": "Description"},
-             "element": {"type": "plain_text_input", "action_id": "value", "multiline": True,
-                         "initial_value": item["description"]}},
-            {"type": "input", "block_id": "hours", "label": {"type": "plain_text", "text": "Hours"},
-             "element": {"type": "plain_text_input", "action_id": "value", "initial_value": str(item["hours"])}},
-            {"type": "input", "block_id": "start_time", "label": {"type": "plain_text", "text": "Start (HH:MM)"},
-             "element": {"type": "plain_text_input", "action_id": "value", "initial_value": item["start_time"]}},
-            {"type": "input", "block_id": "end_time", "label": {"type": "plain_text", "text": "End (HH:MM)"},
-             "element": {"type": "plain_text_input", "action_id": "value", "initial_value": item["end_time"]}},
-            {"type": "input", "block_id": "timezone", "label": {"type": "plain_text", "text": "Timezone"},
-             "element": {"type": "static_select", "action_id": "value",
-                         "initial_option": {"text": {"type": "plain_text", "text": item["timezone"]}, "value": item["timezone"]},
-                         "options": [{"text": {"type": "plain_text", "text": tz}, "value": tz} for tz in TIMEZONES]}},
-        ],
+        "blocks": blocks,
     }
 
 
-def manual_modal(draft_id, category_key, category_label):
+def manual_modal(draft_id, category_key, category_label, assigned_tickets=None):
+    blocks = [
+        {"type": "input", "block_id": "ticket_key", "optional": True,
+         "label": {"type": "plain_text", "text": "Ticket key (optional)"},
+         "element": {"type": "plain_text_input", "action_id": "value"}},
+    ]
+    dropdown = assigned_ticket_dropdown_block(assigned_tickets)
+    if dropdown:
+        blocks.append(dropdown)
+    blocks += [
+        {"type": "input", "block_id": "description", "label": {"type": "plain_text", "text": "What did you do?"},
+         "element": {"type": "plain_text_input", "action_id": "value", "multiline": True}},
+        {"type": "input", "block_id": "hours", "label": {"type": "plain_text", "text": "Hours"},
+         "element": {"type": "plain_text_input", "action_id": "value"}},
+        {"type": "input", "block_id": "timezone", "label": {"type": "plain_text", "text": "Timezone"},
+         "element": {"type": "static_select", "action_id": "value",
+                     "initial_option": {"text": {"type": "plain_text", "text": DEFAULT_TZ}, "value": DEFAULT_TZ},
+                     "options": [{"text": {"type": "plain_text", "text": tz}, "value": tz} for tz in TIMEZONES]}},
+    ]
     return {
         "type": "modal",
         "callback_id": "manual_entry_submit",
         "private_metadata": f"{draft_id}|{category_key}|{category_label}",
         "title": {"type": "plain_text", "text": category_label[:24]},
         "submit": {"type": "plain_text", "text": "Add"},
-        "blocks": [
-            {"type": "input", "block_id": "ticket_key", "optional": True,
-             "label": {"type": "plain_text", "text": "Ticket key (optional)"},
-             "element": {"type": "plain_text_input", "action_id": "value"}},
-            {"type": "input", "block_id": "description", "label": {"type": "plain_text", "text": "What did you do?"},
-             "element": {"type": "plain_text_input", "action_id": "value", "multiline": True}},
-            {"type": "input", "block_id": "hours", "label": {"type": "plain_text", "text": "Hours"},
-             "element": {"type": "plain_text_input", "action_id": "value"}},
-            {"type": "input", "block_id": "timezone", "label": {"type": "plain_text", "text": "Timezone"},
-             "element": {"type": "static_select", "action_id": "value",
-                         "initial_option": {"text": {"type": "plain_text", "text": DEFAULT_TZ}, "value": DEFAULT_TZ},
-                         "options": [{"text": {"type": "plain_text", "text": tz}, "value": tz} for tz in TIMEZONES]}},
-        ],
+        "blocks": blocks,
     }
 
 
@@ -534,6 +630,8 @@ def trigger():
     except RuntimeError as e:
         return jsonify(error=str(e)), 400
     target_date = body.get("date") or date.today().isoformat()
+    email = body.get("email") or get_slack_user_email(slack_user_id)
+    assigned_tickets = jira_get_assigned_tickets(email) if email else []
 
     try:
         messages = fetch_person_messages(slack_user_id, target_date)
@@ -570,6 +668,7 @@ def trigger():
         "manual_items": {},
         "leave_status": "none",
         "submitted": False,
+        "assigned_tickets": assigned_tickets,
     }
 
     try:
@@ -621,12 +720,20 @@ def _handle_interaction(payload):
                 draft["items"][item_id]["status"] = "approved" if action_id == "approve_item" else "skipped"
                 update_draft_message(draft)
 
+        elif action_id == "undo_item":
+            draft_id, item_id = action["value"].split("|")
+            draft = PENDING.get(draft_id)
+            if draft:
+                draft["items"][item_id]["status"] = "pending"
+                update_draft_message(draft)
+
         elif action_id == "edit_item":
             draft_id, item_id = action["value"].split("|")
             draft = PENDING.get(draft_id)
             if draft:
                 slack_api("views.open", trigger_id=trigger_id,
-                          view=edit_modal(draft_id, item_id, draft["items"][item_id]))
+                          view=edit_modal(draft_id, item_id, draft["items"][item_id],
+                                          assigned_tickets=draft.get("assigned_tickets")))
 
         elif action_id == "leave_status":
             draft_id = payload["actions"][0]["block_id"].split("|")[1]
@@ -639,7 +746,10 @@ def _handle_interaction(payload):
             draft_id = payload["actions"][0]["block_id"].split("|")[1]
             key = action["selected_option"]["value"]
             label = dict(MANUAL_CATEGORIES)[key]
-            slack_api("views.open", trigger_id=trigger_id, view=manual_modal(draft_id, key, label))
+            draft = PENDING.get(draft_id)
+            slack_api("views.open", trigger_id=trigger_id,
+                      view=manual_modal(draft_id, key, label,
+                                        assigned_tickets=draft.get("assigned_tickets") if draft else None))
 
         elif action_id == "submit_final":
             draft_id = action["value"]
@@ -658,7 +768,9 @@ def _handle_interaction(payload):
             draft = PENDING.get(draft_id)
             if draft:
                 item = draft["items"][item_id]
-                item["ticket_key"] = values["ticket_key"]["value"]["value"].upper()
+                picked = values.get("assigned_ticket", {}).get("value", {}).get("selected_option")
+                typed = values["ticket_key"]["value"]["value"]
+                item["ticket_key"] = (picked["value"] if picked else typed).upper()
                 item["description"] = values["description"]["value"]["value"]
                 item["hours"] = float(values["hours"]["value"]["value"] or 0)
                 item["start_time"] = values["start_time"]["value"]["value"]
@@ -672,9 +784,11 @@ def _handle_interaction(payload):
             draft = PENDING.get(draft_id)
             if draft:
                 m_id = new_item_id()
+                picked = values.get("assigned_ticket", {}).get("value", {}).get("selected_option")
+                typed = values["ticket_key"]["value"]["value"]
                 draft["manual_items"][m_id] = {
                     "category": label,
-                    "ticket_key": values["ticket_key"]["value"]["value"] or "N/A",
+                    "ticket_key": (picked["value"] if picked else typed) or "N/A",
                     "description": values["description"]["value"]["value"],
                     "hours": float(values["hours"]["value"]["value"] or 0),
                     "timezone": values["timezone"]["value"]["selected_option"]["value"],

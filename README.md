@@ -106,6 +106,13 @@ use "Log the rest" for anything Slack evidence won't catch, then hit
 - **Ticket matching is a best-effort Claude read of Slack text**, not a
   guarantee. Anything outside `ALLOWED_TICKET_KEYS` gets a ⚠️ so you catch
   it before approving, but always skim before you hit Submit.
+- **Assigned-tickets dropdown** (in Edit and the manual-entry modal) is
+  populated by looking up the person's email in Jira and pulling their
+  currently-assigned issues. It needs the `JIRA_EMAIL`/`JIRA_API_TOKEN`
+  account to have permission to browse users and search issues — if it
+  can't find a match, the dropdown just doesn't appear and you fall back to
+  typing the ticket key by hand, no error shown (this is deliberately
+  non-blocking — a Jira hiccup here shouldn't stop you from logging time).
 - I couldn't run this end-to-end against live Slack/Jira from where I built
   it (no network access to those APIs in this sandbox) — the self-check
   covers the pure logic, but the Slack/Jira/Claude calls themselves need
