@@ -104,8 +104,14 @@ use "Log the rest" for anything Slack evidence won't catch, then hit
 - **Timezones are fixed UTC offsets** (IST/EST/CST), no DST. Matches "India
   team first" — revisit with real IANA tz names before expanding to US.
 - **Ticket matching is a best-effort Claude read of Slack text**, not a
-  guarantee. Anything outside `ALLOWED_TICKET_KEYS` gets a ⚠️ so you catch
-  it before approving, but always skim before you hit Submit.
+  guarantee. Anything outside `ALLOWED_TICKET_KEYS` gets a warning so you
+  catch it before approving, but always skim before you hit Submit.
+- **Submit is safe to click more than once.** Each item tracks the Jira
+  worklog it created, so adding more entries and hitting Submit again
+  updates existing worklogs in place instead of duplicating them. One gap:
+  if you **Undo** an item *after* it's already been logged to Jira, the
+  worklog stays in Jira — Undo only affects this draft, it doesn't delete
+  anything already written. Remove it manually in Jira if that happens.
 - **The ticket dropdown** (in Edit and the manual-entry modal) is built
   directly from `ALLOWED_TICKET_KEYS`, with live summaries pulled from
   Jira. Add a ticket key to that env var in Render and it shows up in the

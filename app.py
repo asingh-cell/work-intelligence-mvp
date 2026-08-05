@@ -282,7 +282,10 @@ def jira_get_ticket_options(keys: set) -> list[dict]:
 
 
 def jira_add_worklog(issue_key: str, hours: float, comment: str, target_date: str,
-                      start_time: str, tz: str):
+                      start_time: str, tz: str, worklog_id: str = None):
+    """Creates a new worklog, or updates one in place if worklog_id is given
+    (used when re-submitting an item that was already logged, so editing and
+    resubmitting doesn't create duplicate worklog entries in Jira)."""
     started = f"{target_date}T{start_time}:00.000{TIMEZONES.get(tz, TIMEZONES[DEFAULT_TZ])}"
     body = {
         "timeSpentSeconds": int(round(hours * 3600)),
@@ -293,20 +296,18 @@ def jira_add_worklog(issue_key: str, hours: float, comment: str, target_date: st
             "content": [{"type": "paragraph", "content": [{"type": "text", "text": comment}]}],
         },
     }
+    url = f"{JIRA_SITE}/rest/api/3/issue/{issue_key}/worklog"
+    if worklog_id:
+        url += f"/{worklog_id}"
     try:
-        resp = requests.post(
-            f"{JIRA_SITE}/rest/api/3/issue/{issue_key}/worklog",
-            auth=jira_auth(),
-            json=body,
-            timeout=15,
-        )
+        resp = (requests.put if worklog_id else requests.post)(url, auth=jira_auth(), json=body, timeout=15)
     except requests.RequestException as e:
         log.error("Jira request errored for %s: %s", issue_key, e)
-        return False, str(e)
+        return False, str(e), None
     if resp.status_code >= 300:
         log.error("Jira worklog failed for %s: %s %s", issue_key, resp.status_code, resp.text)
-        return False, resp.text[:300]
-    return True, None
+        return False, resp.text[:300], None
+    return True, None, resp.json().get("id", worklog_id)
 
 
 # ---------------------------------------------------------------------------
@@ -328,12 +329,12 @@ def required_hours_for_leave(leave_status: str) -> float:
     return {"full": 0.0, "half": DAILY_TARGET_HOURS / 2}.get(leave_status, DAILY_TARGET_HOURS)
 
 
-def confidence_dot(confidence: float) -> str:
+def confidence_label(confidence: float) -> str:
     if confidence >= AUTO_WRITE_THRESHOLD:
-        return "🟢"
+        return "High"
     if confidence >= AUTO_WRITE_THRESHOLD - 30:
-        return "🟡"
-    return "🔴"
+        return "Medium"
+    return "Low"
 
 
 def logged_hours(draft: dict) -> float:
@@ -342,21 +343,21 @@ def logged_hours(draft: dict) -> float:
 
 def progress_bar(logged: float, target: float, width: int = 10) -> str:
     if target <= 0:
-        return "🟩" * width
+        return "█" * width
     filled = min(width, round(width * logged / target))
-    return "🟩" * filled + "⬜" * (width - filled)
+    return "█" * filled + "░" * (width - filled)
 
 
 # ---------------------------------------------------------------------------
 # Slack Block Kit rendering
 # ---------------------------------------------------------------------------
 MANUAL_CATEGORIES = [
-    ("existing", "🏢 Existing ticket"),
-    ("internal", "🛠 Internal work"),
-    ("learning", "📚 Learning"),
-    ("meetings", "🗣 Meetings"),
-    ("admin", "🗂 Administration"),
-    ("other", "❓ Other"),
+    ("existing", "Existing ticket"),
+    ("internal", "Internal work"),
+    ("learning", "Learning"),
+    ("meetings", "Meetings"),
+    ("admin", "Administration"),
+    ("other", "Other"),
 ]
 
 
@@ -369,7 +370,7 @@ def render_draft_blocks(draft: dict) -> list:
             "text": {
                 "type": "mrkdwn",
                 "text": (
-                    f"👋 Evening! Here's what I found for *{draft['date']}*. "
+                    f"Evening! Here's what I found for *{draft['date']}*. "
                     f"Give each item a thumbs up or down, then hit Submit — "
                     f"nothing touches Jira until you do."
                 ),
@@ -386,17 +387,21 @@ def render_draft_blocks(draft: dict) -> list:
         {"type": "divider"},
     ]
 
+    if draft.get("submission_summary"):
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": draft["submission_summary"]}})
+        blocks.append({"type": "divider"})
+
     for item_id, item in draft["items"].items():
         if item["status"] == "skipped":
             blocks.append({
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": f"~{item['ticket_key']} — {item['ticket_summary']}~  ⏭ _skipped_"},
+                "text": {"type": "mrkdwn", "text": f"~{item['ticket_key']} — {item['ticket_summary']}~  _Skipped_"},
             })
             blocks.append({
                 "type": "actions",
                 "block_id": f"item_actions|{draft['id']}|{item_id}",
                 "elements": [
-                    {"type": "button", "text": {"type": "plain_text", "text": "↩️ Undo"},
+                    {"type": "button", "text": {"type": "plain_text", "text": "Undo"},
                      "action_id": "undo_item", "value": f"{draft['id']}|{item_id}"},
                 ],
             })
@@ -404,15 +409,17 @@ def render_draft_blocks(draft: dict) -> list:
 
         header = f"*{item['ticket_key']}* — {item['ticket_summary']}"
         if item["ticket_key"] not in ALLOWED_TICKET_KEYS and item["ticket_key"] not in ("N/A", "UNMATCHED"):
-            header += "  ⚠️ _not in your allowed ticket list — check before approving_"
+            header += "  _(Not in your allowed ticket list — check before approving)_"
 
         status_line = ""
         if item["status"] in ("approved", "edited"):
-            status_line = "  ✅ *approved*" if item["status"] == "approved" else "  ✏️ *edited*"
+            status_line = "  *Approved*" if item["status"] == "approved" else "  *Edited*"
+        if item.get("jira_worklog_id"):
+            status_line += "  ·  *Logged to Jira*"
 
         confidence_line = (
-            "📝 manually logged" if item.get("source") == "manual"
-            else f"{confidence_dot(item['confidence'])} {item['confidence']:.0f}% confidence"
+            "Manually logged" if item.get("source") == "manual"
+            else f"{item['confidence']:.0f}% confidence ({confidence_label(item['confidence'])})"
         )
         blocks.append({
             "type": "section",
@@ -420,8 +427,8 @@ def render_draft_blocks(draft: dict) -> list:
                 "type": "mrkdwn",
                 "text": (
                     f"{header}{status_line}\n"
-                    f"{item['hours']}h  {confidence_line}\n"
-                    f"🕒 {item['start_time']} – {item['end_time']} {item['timezone']}, {draft['date']}\n"
+                    f"{item['hours']}h  ·  {confidence_line}\n"
+                    f"{item['start_time']} – {item['end_time']} {item['timezone']}, {draft['date']}\n"
                     f"{item['description']}"
                 ),
             },
@@ -431,11 +438,11 @@ def render_draft_blocks(draft: dict) -> list:
                 "type": "actions",
                 "block_id": f"item_actions|{draft['id']}|{item_id}",
                 "elements": [
-                    {"type": "button", "text": {"type": "plain_text", "text": "✅ Approve"},
+                    {"type": "button", "text": {"type": "plain_text", "text": "Approve"},
                      "style": "primary", "action_id": "approve_item", "value": f"{draft['id']}|{item_id}"},
-                    {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"},
+                    {"type": "button", "text": {"type": "plain_text", "text": "Edit"},
                      "action_id": "edit_item", "value": f"{draft['id']}|{item_id}"},
-                    {"type": "button", "text": {"type": "plain_text", "text": "⏭ Skip"},
+                    {"type": "button", "text": {"type": "plain_text", "text": "Skip"},
                      "style": "danger", "action_id": "skip_item", "value": f"{draft['id']}|{item_id}"},
                 ],
             })
@@ -444,9 +451,9 @@ def render_draft_blocks(draft: dict) -> list:
                 "type": "actions",
                 "block_id": f"item_actions|{draft['id']}|{item_id}",
                 "elements": [
-                    {"type": "button", "text": {"type": "plain_text", "text": "✏️ Edit"},
+                    {"type": "button", "text": {"type": "plain_text", "text": "Edit"},
                      "action_id": "edit_item", "value": f"{draft['id']}|{item_id}"},
-                    {"type": "button", "text": {"type": "plain_text", "text": "↩️ Undo"},
+                    {"type": "button", "text": {"type": "plain_text", "text": "Undo"},
                      "action_id": "undo_item", "value": f"{draft['id']}|{item_id}"},
                 ],
             })
@@ -455,7 +462,7 @@ def render_draft_blocks(draft: dict) -> list:
     blocks.append({"type": "divider"})
     blocks.append({
         "type": "section",
-        "text": {"type": "mrkdwn", "text": f"⌛ *{remaining:.1f}h* still unaccounted for. On leave, or want to log it yourself?"},
+        "text": {"type": "mrkdwn", "text": f"*{remaining:.1f}h* still unaccounted for. On leave, or want to log it yourself?"},
     })
     blocks.append({
         "type": "actions",
@@ -464,7 +471,7 @@ def render_draft_blocks(draft: dict) -> list:
             {
                 "type": "static_select",
                 "action_id": "manual_category",
-                "placeholder": {"type": "plain_text", "text": "📋 Log the rest — pick a category"},
+                "placeholder": {"type": "plain_text", "text": "Log the rest — pick a category"},
                 "options": [
                     {"text": {"type": "plain_text", "text": label}, "value": key}
                     for key, label in MANUAL_CATEGORIES
@@ -473,11 +480,13 @@ def render_draft_blocks(draft: dict) -> list:
             {
                 "type": "static_select",
                 "action_id": "leave_status",
-                "placeholder": {"type": "plain_text", "text": "🌴 Were you on leave?"},
+                "placeholder": {"type": "plain_text", "text": "Leave status"},
                 "options": [
                     {"text": {"type": "plain_text", "text": "No leave"}, "value": "none"},
                     {"text": {"type": "plain_text", "text": "Half-day leave"}, "value": "half"},
                     {"text": {"type": "plain_text", "text": "Full-day leave"}, "value": "full"},
+                    {"text": {"type": "plain_text", "text": "WFH"}, "value": "wfh"},
+                    {"text": {"type": "plain_text", "text": "Other"}, "value": "other"},
                 ],
             },
         ],
@@ -488,7 +497,7 @@ def render_draft_blocks(draft: dict) -> list:
         "type": "actions",
         "block_id": f"submit|{draft['id']}",
         "elements": [
-            {"type": "button", "text": {"type": "plain_text", "text": "🚀 Submit to Jira"},
+            {"type": "button", "text": {"type": "plain_text", "text": "Submit to Jira"},
              "style": "primary", "action_id": "submit_final", "value": draft["id"]},
         ],
     })
@@ -504,7 +513,7 @@ def ticket_dropdown_block(ticket_options: list, initial_key: str = None) -> dict
     here automatically), with a 'no ticket' fallback always available."""
     ticket_options = ticket_options or []
     options = [
-        {"text": {"type": "plain_text", "text": "🚫 No ticket"}, "value": NO_TICKET_SENTINEL},
+        {"text": {"type": "plain_text", "text": "No ticket"}, "value": NO_TICKET_SENTINEL},
     ] + [
         {"text": {"type": "plain_text", "text": f"{t['key']} — {t['summary']}"[:75] if t["summary"] else t["key"]},
          "value": t["key"]}
@@ -523,6 +532,8 @@ def ticket_dropdown_block(ticket_options: list, initial_key: str = None) -> dict
 def edit_modal(draft_id, item_id, item, ticket_options=None):
     blocks = [
         ticket_dropdown_block(ticket_options, initial_key=item["ticket_key"]),
+        {"type": "input", "block_id": "title", "label": {"type": "plain_text", "text": "Title"},
+         "element": {"type": "plain_text_input", "action_id": "value", "initial_value": item["ticket_summary"]}},
         {"type": "input", "block_id": "description", "label": {"type": "plain_text", "text": "Description"},
          "element": {"type": "plain_text_input", "action_id": "value", "multiline": True,
                      "initial_value": item["description"]}},
@@ -550,12 +561,18 @@ def edit_modal(draft_id, item_id, item, ticket_options=None):
 def manual_modal(draft_id, category_key, category_label, ticket_options=None):
     blocks = [
         ticket_dropdown_block(ticket_options),
+        {"type": "input", "block_id": "title", "label": {"type": "plain_text", "text": "Title"},
+         "element": {"type": "plain_text_input", "action_id": "value", "initial_value": category_label}},
         {"type": "input", "block_id": "description", "label": {"type": "plain_text", "text": "What did you do?"},
          "element": {"type": "plain_text_input", "action_id": "value", "multiline": True}},
         {"type": "input", "block_id": "start_time", "label": {"type": "plain_text", "text": "Start time (HH:MM)"},
          "element": {"type": "plain_text_input", "action_id": "value", "initial_value": "09:00"}},
         {"type": "input", "block_id": "hours", "label": {"type": "plain_text", "text": "How many hours?"},
          "element": {"type": "plain_text_input", "action_id": "value"}},
+        {"type": "input", "block_id": "timezone", "label": {"type": "plain_text", "text": "Timezone"},
+         "element": {"type": "static_select", "action_id": "value",
+                     "initial_option": {"text": {"type": "plain_text", "text": DEFAULT_TZ}, "value": DEFAULT_TZ},
+                     "options": [{"text": {"type": "plain_text", "text": tz}, "value": tz} for tz in TIMEZONES]}},
     ]
     return {
         "type": "modal",
@@ -628,6 +645,7 @@ def trigger():
             "end_time": row.get("end_time", "10:00"),
             "timezone": DEFAULT_TZ,
             "status": "pending",
+            "jira_worklog_id": None,
         }
 
     draft = {
@@ -723,7 +741,7 @@ def _handle_interaction(payload):
         elif action_id == "submit_final":
             draft_id = action["value"]
             draft = PENDING.get(draft_id)
-            if draft and not draft["submitted"]:
+            if draft:
                 submit_to_jira(draft)
 
         return "", 200
@@ -739,6 +757,7 @@ def _handle_interaction(payload):
                 item = draft["items"][item_id]
                 selected = values["ticket_key"]["value"]["selected_option"]["value"]
                 item["ticket_key"] = "UNMATCHED" if selected == NO_TICKET_SENTINEL else selected
+                item["ticket_summary"] = values["title"]["value"]["value"]
                 item["description"] = values["description"]["value"]["value"]
                 item["hours"] = float(values["hours"]["value"]["value"] or 0)
                 item["start_time"] = values["start_time"]["value"]["value"]
@@ -755,23 +774,19 @@ def _handle_interaction(payload):
                 ticket_key = "N/A" if selected == NO_TICKET_SENTINEL else selected
                 hours = float(values["hours"]["value"]["value"] or 0)
                 start_time = values["start_time"]["value"]["value"] or "09:00"
-                ticket_summary = label
-                for t in draft.get("ticket_options") or []:
-                    if t["key"] == ticket_key:
-                        ticket_summary = t["summary"] or label
-                        break
                 item_id = new_item_id()
                 draft["items"][item_id] = {
                     "ticket_key": ticket_key,
-                    "ticket_summary": ticket_summary,
+                    "ticket_summary": values["title"]["value"]["value"] or label,
                     "description": values["description"]["value"]["value"],
                     "hours": hours,
                     "confidence": 100.0,
                     "start_time": start_time,
                     "end_time": add_hours_to_time(start_time, hours),
-                    "timezone": DEFAULT_TZ,
+                    "timezone": values["timezone"]["value"]["selected_option"]["value"],
                     "status": "approved",
                     "source": "manual",
+                    "jira_worklog_id": None,
                 }
                 update_draft_message(draft)
 
@@ -781,7 +796,7 @@ def _handle_interaction(payload):
 
 
 def submit_to_jira(draft):
-    results = []
+    results = []  # (ticket_key, ticket_summary, hours, ok, err, was_update)
     for item in draft["items"].values():
         if item["status"] not in ("approved", "edited"):
             continue
@@ -789,27 +804,49 @@ def submit_to_jira(draft):
             # no real ticket to log against (manual entry with "No ticket", or
             # an unmatched Claude guess that was approved anyway) — record
             # locally in the summary rather than sending a doomed Jira call
-            results.append((item["ticket_key"] or item["ticket_summary"], item["hours"], None,
-                             "no matching ticket, logged as note only"))
+            results.append((item["ticket_key"] or item["ticket_summary"], item["ticket_summary"],
+                             item["hours"], None, "no matching ticket, logged as note only", False))
             continue
-        ok, err = jira_add_worklog(
+        was_update = bool(item.get("jira_worklog_id"))
+        ok, err, worklog_id = jira_add_worklog(
             item["ticket_key"], item["hours"], item["description"],
             draft["date"], item["start_time"], item["timezone"],
+            worklog_id=item.get("jira_worklog_id"),
         )
-        results.append((item["ticket_key"], item["hours"], ok, err))
+        if ok:
+            item["jira_worklog_id"] = worklog_id
+        results.append((item["ticket_key"], item["ticket_summary"], item["hours"], ok, err, was_update))
+
+    # Tally per ticket (an item's hours can span multiple entries against the
+    # same ticket — this is the "what actually landed" total, not just a list)
+    totals = {}
+    for key, summary, hours, ok, err, _ in results:
+        if ok:
+            t = totals.setdefault(key, {"summary": summary, "hours": 0.0})
+            t["hours"] += hours
+
+    target = required_hours_for_leave(draft["leave_status"])
+    total_logged = sum(t["hours"] for t in totals.values())
+
+    lines = [f"*Last submitted:* {total_logged:.1f}h of {target:.1f}h target across {len(totals)} ticket(s)."]
+    for key, t in sorted(totals.items()):
+        link = f"<{JIRA_SITE}/browse/{key}|{key}>" if key not in ("N/A", "UNMATCHED") else key
+        lines.append(f"  • {link} — {t['summary']}: *{t['hours']:.1f}h*")
+    failed = [(k, h, e) for k, _, h, ok, e, _ in results if ok is False]
+    notes = [(k, h, e) for k, _, h, ok, e, _ in results if ok is None]
+    if failed:
+        lines.append("*Failed:*")
+        for k, h, e in failed:
+            lines.append(f"  • {k}: {h}h — {e}")
+    if notes:
+        lines.append("*Not logged to Jira (no ticket attached):*")
+        for k, h, e in notes:
+            lines.append(f"  • {k}: {h}h")
+    lines.append("_You can still Edit, Undo, or add more below, then hit Submit again — already-logged entries get updated, not duplicated._")
 
     draft["submitted"] = True
-    lines = ["✅ *Submitted.*"]
-    for key, hours, ok, err in results:
-        if ok is True:
-            lines.append(f"• {key}: {hours}h logged to Jira")
-        elif ok is False:
-            lines.append(f"• {key}: {hours}h *failed* — {err}")
-        else:
-            lines.append(f"• {key}: {hours}h — {err}")
-    slack_api("chat.update", channel=draft["channel"], ts=draft["ts"],
-              text="Timesheet submitted",
-              blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}}])
+    draft["submission_summary"] = "\n".join(lines)
+    update_draft_message(draft)
 
 
 if __name__ == "__main__":

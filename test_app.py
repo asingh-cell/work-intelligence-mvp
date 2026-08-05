@@ -17,14 +17,16 @@ def test_required_hours_for_leave():
     assert app.required_hours_for_leave("full") == 0.0
     assert app.required_hours_for_leave("half") == 4.0
     assert app.required_hours_for_leave("none") == 8.0
+    assert app.required_hours_for_leave("wfh") == 8.0
+    assert app.required_hours_for_leave("other") == 8.0
     assert app.required_hours_for_leave("garbage") == 8.0  # unknown -> full day, safest default
 
 
-def test_confidence_dot():
+def test_confidence_label():
     app.AUTO_WRITE_THRESHOLD = 70
-    assert app.confidence_dot(90) == "🟢"
-    assert app.confidence_dot(50) == "🟡"
-    assert app.confidence_dot(10) == "🔴"
+    assert app.confidence_label(90) == "High"
+    assert app.confidence_label(50) == "Medium"
+    assert app.confidence_label(10) == "Low"
 
 
 def test_parse_claude_json_handles_fences_and_garbage():
@@ -47,10 +49,10 @@ def test_logged_hours_only_counts_resolved_items():
 
 
 def test_progress_bar_bounds():
-    assert app.progress_bar(0, 8) == "⬜" * 10
-    assert app.progress_bar(8, 8) == "🟩" * 10
-    assert app.progress_bar(4, 8) == "🟩" * 5 + "⬜" * 5
-    assert app.progress_bar(100, 8) == "🟩" * 10  # never overflows past full bar
+    assert app.progress_bar(0, 8) == "░" * 10
+    assert app.progress_bar(8, 8) == "█" * 10
+    assert app.progress_bar(4, 8) == "█" * 5 + "░" * 5
+    assert app.progress_bar(100, 8) == "█" * 10  # never overflows past full bar
 
 
 def test_add_hours_to_time():
