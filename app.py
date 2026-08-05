@@ -513,24 +513,28 @@ def render_draft_blocks(draft: dict) -> list:
     return blocks
 
 
-def assigned_ticket_dropdown_block(assigned_tickets: list, initial_key: str = None) -> dict | None:
-    """Optional dropdown of the person's currently-assigned Jira tickets.
-    Returns None when we have no list (Jira lookup failed or found nothing) —
-    callers fall back to the free-text ticket_key field in that case."""
-    if not assigned_tickets:
-        return None
+NO_TICKET_SENTINEL = "__NONE__"
+
+
+def assigned_ticket_dropdown_block(assigned_tickets: list, initial_key: str = None) -> dict:
+    """Dropdown of the person's currently-assigned Jira tickets, always with
+    a 'no ticket' fallback first so the UI is consistent even when the Jira
+    lookup found nothing (wrong permissions, nothing assigned yet, etc.) —
+    the person can still type a key by hand in that case."""
+    assigned_tickets = assigned_tickets or []
     options = [
+        {"text": {"type": "plain_text", "text": "🚫 No ticket / I'll type it below"}, "value": NO_TICKET_SENTINEL},
+    ] + [
         {"text": {"type": "plain_text", "text": f"{t['key']} — {t['summary']}"[:75]}, "value": t["key"]}
-        for t in assigned_tickets[:100]  # Slack's static_select option limit
+        for t in assigned_tickets[:99]  # Slack's static_select option limit is 100
     ]
     block = {
         "type": "input", "block_id": "assigned_ticket", "optional": True,
-        "label": {"type": "plain_text", "text": "Or pick from your assigned tickets"},
+        "label": {"type": "plain_text", "text": "Pick from your assigned tickets (or type one below)"},
         "element": {"type": "static_select", "action_id": "value", "options": options},
     }
-    match = next((o for o in options if o["value"] == initial_key), None)
-    if match:
-        block["element"]["initial_option"] = match
+    match = next((o for o in options if o["value"] == initial_key), options[0])
+    block["element"]["initial_option"] = match
     return block
 
 
@@ -770,7 +774,7 @@ def _handle_interaction(payload):
                 item = draft["items"][item_id]
                 picked = values.get("assigned_ticket", {}).get("value", {}).get("selected_option")
                 typed = values["ticket_key"]["value"]["value"]
-                item["ticket_key"] = (picked["value"] if picked else typed).upper()
+                item["ticket_key"] = ((picked["value"] if picked and picked["value"] != NO_TICKET_SENTINEL else typed) or "UNMATCHED").upper()
                 item["description"] = values["description"]["value"]["value"]
                 item["hours"] = float(values["hours"]["value"]["value"] or 0)
                 item["start_time"] = values["start_time"]["value"]["value"]
@@ -788,7 +792,7 @@ def _handle_interaction(payload):
                 typed = values["ticket_key"]["value"]["value"]
                 draft["manual_items"][m_id] = {
                     "category": label,
-                    "ticket_key": (picked["value"] if picked else typed) or "N/A",
+                    "ticket_key": (picked["value"] if picked and picked["value"] != NO_TICKET_SENTINEL else typed) or "N/A",
                     "description": values["description"]["value"]["value"],
                     "hours": float(values["hours"]["value"]["value"] or 0),
                     "timezone": values["timezone"]["value"]["selected_option"]["value"],
