@@ -77,9 +77,37 @@ TIMEZONES = {
 DEFAULT_TZ = "IST"
 
 # ---------------------------------------------------------------------------
-# In-memory draft store — see ponytail note at top of file
+# In-memory draft store, backed by a best-effort JSON file so a review that
+# takes longer than a few minutes has a chance of surviving a process
+# restart (Render redeploy, or the free tier spinning down after idle).
+# ponytail: single flat file, whole-dict last-write-wins — fine for one
+# person's timesheet flow, not safe for concurrent multi-writer load. Also:
+# I can't verify from here whether Render's free tier preserves local disk
+# across a full spin-down (vs. just a redeploy) — test it empirically. If a
+# draft still doesn't survive an hour-long gap after this, the reliable fix
+# is a paid Render plan with a persistent disk, or an external store (e.g.
+# Postgres) — ask and I'll wire it up.
 # ---------------------------------------------------------------------------
-PENDING = {}  # draft_id -> draft dict
+PENDING_STORE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pending_drafts.json")
+
+
+def load_pending() -> dict:
+    try:
+        with open(PENDING_STORE_PATH) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_pending():
+    try:
+        with open(PENDING_STORE_PATH, "w") as f:
+            json.dump(PENDING, f)
+    except OSError as e:
+        log.error("Couldn't persist PENDING to disk: %s", e)
+
+
+PENDING = load_pending()  # draft_id -> draft dict
 
 
 def new_item_id():
@@ -381,11 +409,23 @@ def render_draft_blocks(draft: dict) -> list:
             "text": {
                 "type": "mrkdwn",
                 "text": f"{progress_bar(logged, target)}  *{logged:.1f}h / {target:.1f}h*"
-                + (f"  _(leave: {draft['leave_status']})_" if draft["leave_status"] != "none" else ""),
+                + (f"  _(leave: {draft['leave_status']}"
+                   + (f" — {draft['leave_note']}" if draft.get("leave_note") else "")
+                   + ")_" if draft["leave_status"] != "none" else ""),
             },
         },
         {"type": "divider"},
     ]
+    if draft["leave_status"] == "other":
+        blocks.append({
+            "type": "actions",
+            "block_id": f"leave_note_controls|{draft['id']}",
+            "elements": [
+                {"type": "button",
+                 "text": {"type": "plain_text", "text": "Add/edit note" if draft.get("leave_note") else "Add a note"},
+                 "action_id": "edit_leave_note", "value": draft["id"]},
+            ],
+        })
 
     if draft.get("submission_summary"):
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": draft["submission_summary"]}})
@@ -558,6 +598,21 @@ def edit_modal(draft_id, item_id, item, ticket_options=None):
     }
 
 
+def leave_note_modal(draft_id, current_note=""):
+    return {
+        "type": "modal",
+        "callback_id": "leave_note_submit",
+        "private_metadata": draft_id,
+        "title": {"type": "plain_text", "text": "Leave note"},
+        "submit": {"type": "plain_text", "text": "Save"},
+        "blocks": [
+            {"type": "input", "block_id": "note", "label": {"type": "plain_text", "text": "What's the reason?"},
+             "element": {"type": "plain_text_input", "action_id": "value", "multiline": True,
+                         "initial_value": current_note}},
+        ],
+    }
+
+
 def manual_modal(draft_id, category_key, category_label, ticket_options=None):
     blocks = [
         ticket_dropdown_block(ticket_options),
@@ -585,6 +640,7 @@ def manual_modal(draft_id, category_key, category_label, ticket_options=None):
 
 
 def update_draft_message(draft):
+    save_pending()
     slack_api(
         "chat.update",
         channel=draft["channel"],
@@ -672,6 +728,7 @@ def trigger():
         return jsonify(error=str(e)), 502
     draft["ts"] = post["ts"]
     PENDING[draft_id] = draft
+    save_pending()
 
     return jsonify(draft_id=draft_id, items_found=len(items)), 200
 
@@ -728,6 +785,16 @@ def _handle_interaction(payload):
             if draft:
                 draft["leave_status"] = action["selected_option"]["value"]
                 update_draft_message(draft)
+                if draft["leave_status"] == "other":
+                    slack_api("views.open", trigger_id=trigger_id,
+                              view=leave_note_modal(draft_id, draft.get("leave_note", "")))
+
+        elif action_id == "edit_leave_note":
+            draft_id = action["value"]
+            draft = PENDING.get(draft_id)
+            if draft:
+                slack_api("views.open", trigger_id=trigger_id,
+                          view=leave_note_modal(draft_id, draft.get("leave_note", "")))
 
         elif action_id == "manual_category":
             draft_id = payload["actions"][0]["block_id"].split("|")[1]
@@ -750,7 +817,14 @@ def _handle_interaction(payload):
         callback_id = payload["view"]["callback_id"]
         values = payload["view"]["state"]["values"]
 
-        if callback_id == "edit_item_submit":
+        if callback_id == "leave_note_submit":
+            draft_id = payload["view"]["private_metadata"]
+            draft = PENDING.get(draft_id)
+            if draft:
+                draft["leave_note"] = values["note"]["value"]["value"]
+                update_draft_message(draft)
+
+        elif callback_id == "edit_item_submit":
             draft_id, item_id = payload["view"]["private_metadata"].split("|")
             draft = PENDING.get(draft_id)
             if draft:
