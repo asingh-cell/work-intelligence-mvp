@@ -236,9 +236,9 @@ Group them into distinct pieces of work. For each piece of work return:
   the person will fill it in themselves when they see hours is 0.
 - confidence: 0-100. If hours had to be set to 0 because none was stated, cap this at 40 regardless
   of how confident you are about the ticket match — the missing duration is the limiting factor.
-- start_time / end_time: 24h HH:MM in {tz} local time. Only fill these from an explicit time
-  mentioned in the message; otherwise use "09:00" / "09:00" as a placeholder (hours=0 will make it
-  obvious this needs review, so don't invent a plausible time range to compensate).
+- start_time: 24h HH:MM in {tz} local time. Only use an explicit clock time mentioned in the
+  message; otherwise use "09:00" as a neutral placeholder. Do not output end_time — it's computed
+  separately from start_time and hours, so it always stays consistent with the duration.
 Do not invent tickets outside the allowed list. Do not exceed a combined total of {daily_target} hours
 unless the evidence clearly supports more.
 
@@ -246,7 +246,7 @@ Messages:
 {messages}
 
 Respond with ONLY a JSON array of objects with exactly these keys:
-ticket_key, ticket_summary, description, hours, confidence, start_time, end_time
+ticket_key, ticket_summary, description, hours, confidence, start_time
 No prose, no markdown fences, just the JSON array. If there is no usable evidence, return [].
 """
 
@@ -495,7 +495,7 @@ def render_draft_blocks(draft: dict) -> list:
                      "style": "danger", "action_id": "skip_item", "value": f"{draft['id']}|{item_id}"},
                 ],
             })
-        else:
+        elif not item.get("synced"):
             blocks.append({
                 "type": "actions",
                 "block_id": f"item_actions|{draft['id']}|{item_id}",
@@ -506,6 +506,8 @@ def render_draft_blocks(draft: dict) -> list:
                      "action_id": "undo_item", "value": f"{draft['id']}|{item_id}"},
                 ],
             })
+        # else: already synced — nothing more to do with this one here; to
+        # correct it after this point, edit the worklog directly in Jira.
 
     remaining = max(0.0, target - logged)
     blocks.append({"type": "divider"})
@@ -743,14 +745,16 @@ def trigger():
     items = {}
     for row in extracted:
         item_id = new_item_id()
+        hours = float(row.get("hours", 0) or 0)
+        start_time = row.get("start_time", "09:00")
         items[item_id] = {
             "ticket_key": str(row.get("ticket_key", "UNMATCHED")).upper(),
             "ticket_summary": row.get("ticket_summary", ""),
             "description": row.get("description", ""),
-            "hours": float(row.get("hours", 0) or 0),
+            "hours": hours,
             "confidence": float(row.get("confidence", 0) or 0),
-            "start_time": row.get("start_time", "09:00"),
-            "end_time": row.get("end_time", "10:00"),
+            "start_time": start_time,
+            "end_time": add_hours_to_time(start_time, hours),
             "timezone": DEFAULT_TZ,
             "status": "pending",
             "jira_worklog_id": None,
