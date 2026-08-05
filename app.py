@@ -170,7 +170,15 @@ def resolve_slack_user_id(email: str = None, slack_user_id: str = None) -> str:
     if slack_user_id:
         return slack_user_id.strip()
     if email:
-        resp = slack_api("users.lookupByEmail", email=email.strip())
+        # users.lookupByEmail is one of Slack's older methods — it rejects a
+        # JSON body (invalid_arguments) and wants form-encoded params instead,
+        # unlike every other Slack call in this app.
+        resp = requests.get(
+            "https://slack.com/api/users.lookupByEmail",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            params={"email": email.strip()},
+            timeout=15,
+        ).json()
         require_ok(resp, f"looking up Slack user for {email}")
         return resp["user"]["id"]
     raise RuntimeError("provide either 'email' or 'slack_user_id' in the request body")
