@@ -490,7 +490,7 @@ def update_draft_message(draft):
 # ---------------------------------------------------------------------------
 @app.route("/health")
 def health():
-    return jsonify(status="ok")
+    return jsonify(status="ok", commit=os.environ.get("RENDER_GIT_COMMIT", "unknown")[:7])
 
 
 @app.route("/trigger", methods=["POST"])
