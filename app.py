@@ -230,9 +230,15 @@ Group them into distinct pieces of work. For each piece of work return:
 - ticket_key: one of the allowed keys, or "UNMATCHED"
 - ticket_summary: a concise one-line description of what that ticket is about
 - description: a short worklog-ready description of what was actually done, in your own words
-- hours: your best estimate of time spent (numbers, can be fractional, e.g. 1.5)
-- confidence: 0-100, how confident you are this mapping/estimate is correct
-- start_time / end_time: 24h HH:MM in {tz} local time, your best estimate
+- hours: ONLY if the message states or clearly implies a duration (e.g. "spent 2 hours on X",
+  "1.5h fixing Y", a start and end time). If no duration is stated anywhere, set hours to 0 —
+  do not guess a plausible-sounding number. A fabricated hour count is worse than a blank one;
+  the person will fill it in themselves when they see hours is 0.
+- confidence: 0-100. If hours had to be set to 0 because none was stated, cap this at 40 regardless
+  of how confident you are about the ticket match — the missing duration is the limiting factor.
+- start_time / end_time: 24h HH:MM in {tz} local time. Only fill these from an explicit time
+  mentioned in the message; otherwise use "09:00" / "09:00" as a placeholder (hours=0 will make it
+  obvious this needs review, so don't invent a plausible time range to compensate).
 Do not invent tickets outside the allowed list. Do not exceed a combined total of {daily_target} hours
 unless the evidence clearly supports more.
 
@@ -427,10 +433,6 @@ def render_draft_blocks(draft: dict) -> list:
             ],
         })
 
-    if draft.get("submission_summary"):
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": draft["submission_summary"]}})
-        blocks.append({"type": "divider"})
-
     for item_id, item in draft["items"].items():
         if item["status"] == "skipped":
             blocks.append({
@@ -447,31 +449,38 @@ def render_draft_blocks(draft: dict) -> list:
             })
             continue
 
-        header = f"*{item['ticket_key']}* — {item['ticket_summary']}"
+        if item["ticket_key"] in ALLOWED_TICKET_KEYS:
+            ticket_display = f"<{JIRA_SITE}/browse/{item['ticket_key']}|{item['ticket_key']}>"
+        else:
+            ticket_display = item["ticket_key"]
+        header = f"*{ticket_display}* — {item['ticket_summary']}"
         if item["ticket_key"] not in ALLOWED_TICKET_KEYS and item["ticket_key"] not in ("N/A", "UNMATCHED"):
             header += "  _(Not in your allowed ticket list — check before approving)_"
 
         status_line = ""
         if item["status"] in ("approved", "edited"):
-            status_line = "  *Approved*" if item["status"] == "approved" else "  *Edited*"
+            status_line = "  ·  *Approved*" if item["status"] == "approved" else "  ·  *Edited*"
         if item.get("jira_worklog_id"):
             status_line += "  ·  *Logged to Jira*"
 
-        confidence_line = (
+        confidence_text = (
             "Manually logged" if item.get("source") == "manual"
             else f"{item['confidence']:.0f}% confidence ({confidence_label(item['confidence'])})"
         )
         blocks.append({
             "type": "section",
-            "text": {
+            "text": {"type": "mrkdwn", "text": f"{header}{status_line}"},
+        })
+        blocks.append({
+            "type": "context",
+            "elements": [{
                 "type": "mrkdwn",
-                "text": (
-                    f"{header}{status_line}\n"
-                    f"{item['hours']}h  ·  {confidence_line}\n"
-                    f"{item['start_time']} – {item['end_time']} {item['timezone']}, {draft['date']}\n"
-                    f"{item['description']}"
-                ),
-            },
+                "text": f"{item['hours']}h  ·  {confidence_text}  ·  {item['start_time']}–{item['end_time']} {item['timezone']}",
+            }],
+        })
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"> {item['description']}"},
         })
         if item["status"] not in ("approved", "edited"):
             blocks.append({
@@ -541,6 +550,8 @@ def render_draft_blocks(draft: dict) -> list:
              "style": "primary", "action_id": "submit_final", "value": draft["id"]},
         ],
     })
+    if draft.get("submission_summary"):
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": draft["submission_summary"]}})
     return blocks
 
 
@@ -579,10 +590,10 @@ def edit_modal(draft_id, item_id, item, ticket_options=None):
                      "initial_value": item["description"]}},
         {"type": "input", "block_id": "hours", "label": {"type": "plain_text", "text": "Hours"},
          "element": {"type": "plain_text_input", "action_id": "value", "initial_value": str(item["hours"])}},
-        {"type": "input", "block_id": "start_time", "label": {"type": "plain_text", "text": "Start (HH:MM)"},
-         "element": {"type": "plain_text_input", "action_id": "value", "initial_value": item["start_time"]}},
-        {"type": "input", "block_id": "end_time", "label": {"type": "plain_text", "text": "End (HH:MM)"},
-         "element": {"type": "plain_text_input", "action_id": "value", "initial_value": item["end_time"]}},
+        {"type": "input", "block_id": "start_time", "label": {"type": "plain_text", "text": "Start"},
+         "element": {"type": "timepicker", "action_id": "value", "initial_time": item["start_time"]}},
+        {"type": "input", "block_id": "end_time", "label": {"type": "plain_text", "text": "End"},
+         "element": {"type": "timepicker", "action_id": "value", "initial_time": item["end_time"]}},
         {"type": "input", "block_id": "timezone", "label": {"type": "plain_text", "text": "Timezone"},
          "element": {"type": "static_select", "action_id": "value",
                      "initial_option": {"text": {"type": "plain_text", "text": item["timezone"]}, "value": item["timezone"]},
@@ -620,8 +631,8 @@ def manual_modal(draft_id, category_key, category_label, ticket_options=None):
          "element": {"type": "plain_text_input", "action_id": "value", "initial_value": category_label}},
         {"type": "input", "block_id": "description", "label": {"type": "plain_text", "text": "What did you do?"},
          "element": {"type": "plain_text_input", "action_id": "value", "multiline": True}},
-        {"type": "input", "block_id": "start_time", "label": {"type": "plain_text", "text": "Start time (HH:MM)"},
-         "element": {"type": "plain_text_input", "action_id": "value", "initial_value": "09:00"}},
+        {"type": "input", "block_id": "start_time", "label": {"type": "plain_text", "text": "Start time"},
+         "element": {"type": "timepicker", "action_id": "value", "initial_time": "09:00"}},
         {"type": "input", "block_id": "hours", "label": {"type": "plain_text", "text": "How many hours?"},
          "element": {"type": "plain_text_input", "action_id": "value"}},
         {"type": "input", "block_id": "timezone", "label": {"type": "plain_text", "text": "Timezone"},
@@ -834,8 +845,8 @@ def _handle_interaction(payload):
                 item["ticket_summary"] = values["title"]["value"]["value"]
                 item["description"] = values["description"]["value"]["value"]
                 item["hours"] = float(values["hours"]["value"]["value"] or 0)
-                item["start_time"] = values["start_time"]["value"]["value"]
-                item["end_time"] = values["end_time"]["value"]["value"]
+                item["start_time"] = values["start_time"]["value"]["selected_time"]
+                item["end_time"] = values["end_time"]["value"]["selected_time"]
                 item["timezone"] = values["timezone"]["value"]["selected_option"]["value"]
                 item["status"] = "edited"
                 update_draft_message(draft)
@@ -847,7 +858,7 @@ def _handle_interaction(payload):
                 selected = values["ticket_key"]["value"]["selected_option"]["value"]
                 ticket_key = "N/A" if selected == NO_TICKET_SENTINEL else selected
                 hours = float(values["hours"]["value"]["value"] or 0)
-                start_time = values["start_time"]["value"]["value"] or "09:00"
+                start_time = values["start_time"]["value"]["selected_time"] or "09:00"
                 item_id = new_item_id()
                 draft["items"][item_id] = {
                     "ticket_key": ticket_key,
