@@ -74,6 +74,19 @@ def test_time_options_and_rounding():
     assert app.nearest_time_slot("garbage") == "09:00"
 
 
+def test_ist_day_window_includes_early_morning_messages():
+    from datetime import datetime
+    # The exact failure case: a message posted at 1:10 AM IST should count as
+    # "today" (IST), even though that instant falls in the *previous* UTC day.
+    msg_ts = datetime(2026, 8, 6, 1, 10, tzinfo=app.IST).timestamp()
+    day = datetime.strptime("2026-08-06", "%Y-%m-%d").replace(tzinfo=app.IST)
+    oldest, latest = day.timestamp(), (day + app.timedelta(days=1)).timestamp()
+    assert oldest <= msg_ts < latest
+    # And a message from the day before should NOT leak into today's window
+    prev_day_msg_ts = datetime(2026, 8, 5, 23, 0, tzinfo=app.IST).timestamp()
+    assert not (oldest <= prev_day_msg_ts < latest)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in list(globals().items()) if k.startswith("test_")]
     for t in tests:

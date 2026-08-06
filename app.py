@@ -19,7 +19,7 @@ import time
 import uuid
 import hashlib
 import logging
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, timezone
 
 import requests
 from flask import Flask, request, jsonify
@@ -75,6 +75,7 @@ TIMEZONES = {
     "CST": "-0600",
 }
 DEFAULT_TZ = "IST"
+IST = timezone(timedelta(hours=5, minutes=30))
 
 # ---------------------------------------------------------------------------
 # In-memory draft store, backed by a best-effort JSON file so a review that
@@ -153,8 +154,9 @@ def verify_slack_signature(req) -> bool:
 
 def fetch_person_messages(slack_user_id: str, target_date: str) -> list[dict]:
     """Pull that person's messages (top-level + thread replies) from the
-    configured evidence channels for the given YYYY-MM-DD date."""
-    day = datetime.strptime(target_date, "%Y-%m-%d")
+    configured evidence channels for the given YYYY-MM-DD date, anchored to
+    IST midnight regardless of what timezone the server itself runs in."""
+    day = datetime.strptime(target_date, "%Y-%m-%d").replace(tzinfo=IST)
     oldest = str(day.timestamp())
     latest = str((day + timedelta(days=1)).timestamp())
 
@@ -746,7 +748,7 @@ def trigger():
         )
     except RuntimeError as e:
         return jsonify(error=str(e)), 400
-    target_date = body.get("date") or date.today().isoformat()
+    target_date = body.get("date") or datetime.now(IST).date().isoformat()
     ticket_options = jira_get_ticket_options(ALLOWED_TICKET_KEYS)
 
     try:
