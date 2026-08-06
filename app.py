@@ -404,6 +404,23 @@ MANUAL_CATEGORIES = [
 def render_draft_blocks(draft: dict) -> list:
     target = required_hours_for_leave(draft["leave_status"])
     logged = logged_hours(draft)
+    has_unsynced = any(
+        item["status"] in ("approved", "edited") and not item.get("synced")
+        for item in draft["items"].values()
+    )
+    fully_done = not has_unsynced and bool(draft.get("submission_summary"))
+
+    if fully_done:
+        # Nothing left to review or send — collapse to a clean receipt instead
+        # of leaving a form full of dead buttons on screen.
+        return [
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"All set for *{draft['date']}* ✓"},
+            },
+            {"type": "section", "text": {"type": "mrkdwn", "text": draft["submission_summary"]}},
+        ]
+
     blocks = [
         {
             "type": "section",
@@ -411,8 +428,8 @@ def render_draft_blocks(draft: dict) -> list:
                 "type": "mrkdwn",
                 "text": (
                     f"Evening! Here's what I found for *{draft['date']}*. "
-                    f"Give each item a thumbs up or down, then hit Submit — "
-                    f"nothing touches Jira until you do."
+                    f"Take a look, then hit Submit whenever you're ready — "
+                    f"nothing touches Jira until then."
                 ),
             },
         },
@@ -549,10 +566,6 @@ def render_draft_blocks(draft: dict) -> list:
         ],
     })
 
-    has_unsynced = any(
-        item["status"] in ("approved", "edited") and not item.get("synced")
-        for item in draft["items"].values()
-    )
     blocks.append({"type": "divider"})
     if has_unsynced:
         blocks.append({
@@ -934,6 +947,19 @@ def _handle_interaction(payload):
     return "", 200
 
 
+def build_receipt_table(results: list) -> str:
+    headers = ["TICKET", "HOURS", "STATUS", "WHAT"]
+    rows = []
+    for r in results:
+        status = "Logged" if r["ok"] is True else ("Failed" if r["ok"] is False else "No ticket")
+        what = r["description"][:36] + ("…" if len(r["description"]) > 36 else "")
+        rows.append([r["key"], f"{r['hours']}h", status, what])
+    widths = [max(len(headers[i]), *(len(row[i]) for row in rows)) for i in range(4)]
+    fmt_row = lambda row: "  ".join(cell.ljust(w) for cell, w in zip(row, widths))
+    lines = [fmt_row(headers), "  ".join("-" * w for w in widths)] + [fmt_row(r) for r in rows]
+    return "```\n" + "\n".join(lines) + "\n```"
+
+
 def submit_to_jira(draft):
     results = []  # dicts: key, description, hours, ok, err
     for item in draft["items"].values():
@@ -964,22 +990,20 @@ def submit_to_jira(draft):
                          "hours": item["hours"], "ok": ok, "err": err})
 
     logged_now = sum(r["hours"] for r in results if r["ok"] is True)
-    lines = [f"*Last submitted:* {logged_now:.1f}h across {len(results)} entr{'y' if len(results) == 1 else 'ies'}."]
-    for r in results:
-        what = r["description"][:80] + ("…" if len(r["description"]) > 80 else "")
-        link = f"<{JIRA_SITE}/browse/{r['key']}|{r['key']}>" if r["key"] not in ("N/A", "UNMATCHED") else r["key"]
-        if r["ok"] is True:
-            lines.append(f"  • {link} — *{r['hours']}h* — {what}")
-        elif r["ok"] is False:
-            lines.append(f"  • {link} — {r['hours']}h — *failed*: {r['err']}")
-        else:
-            lines.append(f"  • {link} — {r['hours']}h — {what}  _(not logged — no ticket attached)_")
-    if not results:
-        lines.append("_Nothing new to submit this round._")
-    lines.append("_Edit, Undo, or add more below — Submit reappears once there's something new to send._")
+    count = len(results)
+    if count == 0:
+        draft["submission_summary"] = "Nothing new to submit this round."
+    else:
+        entry_word = "entry" if count == 1 else "entries"
+        summary_lines = [f"✓ Logged *{logged_now:.1f}h* across {count} {entry_word}:", build_receipt_table(results)]
+        failed = [r for r in results if r["ok"] is False]
+        if failed:
+            summary_lines.append(
+                f"Heads up — {len(failed)} didn't go through. See the STATUS column above for why."
+            )
+        draft["submission_summary"] = "\n".join(summary_lines)
 
     draft["submitted"] = True
-    draft["submission_summary"] = "\n".join(lines)
     update_draft_message(draft)
 
 
