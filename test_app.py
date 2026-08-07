@@ -87,6 +87,14 @@ def test_ist_day_window_includes_early_morning_messages():
     assert not (oldest <= prev_day_msg_ts < latest)
 
 
+def test_evidence_marker_filters_untagged_messages():
+    marker = app.EVIDENCE_MARKER
+    tagged = f"Fixed the review-flow bug {marker} verified all three cases"
+    untagged = "just chatting about lunch plans"
+    assert marker in tagged.lower()
+    assert marker not in untagged.lower()
+
+
 if __name__ == "__main__":
     tests = [v for k, v in list(globals().items()) if k.startswith("test_")]
     for t in tests:

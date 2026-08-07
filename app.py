@@ -64,6 +64,12 @@ except json.JSONDecodeError:
 # confidence (0-100) at/above which an item gets a green dot instead of yellow/red
 AUTO_WRITE_THRESHOLD = float(os.environ.get("AUTO_WRITE_THRESHOLD", "70"))
 
+# Only messages containing this marker get pulled into the pipeline at all —
+# everything else in the channel is invisible to this app. Off by default
+# behavior would be "read everything"; requiring an explicit tag is the
+# safer default for channels that carry sensitive context.
+EVIDENCE_MARKER = os.environ.get("EVIDENCE_MARKER", "@jira").lower()
+
 DAILY_TARGET_HOURS = 8.0
 
 # ponytail: fixed UTC offsets, no DST math. Fine while this only runs for the
@@ -171,7 +177,8 @@ def fetch_person_messages(slack_user_id: str, target_date: str) -> list[dict]:
             if not resp.get("ok"):
                 break
             for msg in resp.get("messages", []):
-                if msg.get("user") == slack_user_id and msg.get("text"):
+                if (msg.get("user") == slack_user_id and msg.get("text")
+                        and EVIDENCE_MARKER in msg["text"].lower()):
                     collected.append({"channel": channel_id, "text": msg["text"], "ts": msg["ts"]})
                 # thread replies
                 if msg.get("reply_count"):
@@ -179,7 +186,8 @@ def fetch_person_messages(slack_user_id: str, target_date: str) -> list[dict]:
                         "conversations.replies", channel=channel_id, ts=msg["ts"]
                     )
                     for r in replies.get("messages", []):
-                        if r.get("user") == slack_user_id and r.get("text") and r["ts"] != msg["ts"]:
+                        if (r.get("user") == slack_user_id and r.get("text") and r["ts"] != msg["ts"]
+                                and EVIDENCE_MARKER in r["text"].lower()):
                             collected.append({"channel": channel_id, "text": r["text"], "ts": r["ts"]})
             cursor = resp.get("response_metadata", {}).get("next_cursor")
             if not cursor:
