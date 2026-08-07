@@ -394,6 +394,31 @@ def logged_hours(draft: dict) -> float:
     return sum(item["hours"] for item in draft["items"].values() if item["status"] in ("approved", "edited"))
 
 
+def _minutes(hhmm: str) -> int:
+    h, m = (int(x) for x in hhmm.split(":"))
+    return h * 60 + m
+
+
+def conflicting_item_ids(draft: dict) -> set:
+    """Item IDs whose time range overlaps another non-skipped item's range.
+    Two ranges overlap if start1 < end2 and start2 < end1 — the standard
+    interval-overlap check."""
+    active = [
+        (item_id, _minutes(item["start_time"]), _minutes(item["end_time"]))
+        for item_id, item in draft["items"].items()
+        if item["status"] != "skipped"
+    ]
+    conflicts = set()
+    for i in range(len(active)):
+        id_a, start_a, end_a = active[i]
+        for j in range(i + 1, len(active)):
+            id_b, start_b, end_b = active[j]
+            if start_a < end_b and start_b < end_a:
+                conflicts.add(id_a)
+                conflicts.add(id_b)
+    return conflicts
+
+
 def progress_bar(logged: float, target: float, width: int = 10) -> str:
     if target <= 0:
         return "█" * width
@@ -417,6 +442,7 @@ MANUAL_CATEGORIES = [
 def render_draft_blocks(draft: dict) -> list:
     target = required_hours_for_leave(draft["leave_status"])
     logged = logged_hours(draft)
+    conflicts = conflicting_item_ids(draft)
     has_unsynced = any(
         item["status"] in ("approved", "edited") and not item.get("synced")
         for item in draft["items"].values()
@@ -492,6 +518,10 @@ def render_draft_blocks(draft: dict) -> list:
         header = f"*{ticket_display}* — {item['ticket_summary']}"
         if item["ticket_key"] not in ALLOWED_TICKET_KEYS and item["ticket_key"] not in ("N/A", "UNMATCHED"):
             header += "  _(Not in your allowed ticket list — check before approving)_"
+        if item_id in conflicts:
+            header += "  _(Time overlaps with another entry below — check both)_"
+        if _minutes(item["end_time"]) >= _minutes("20:00"):
+            header += f"  _(After 8 PM — double check this is for {draft['date']}, not the next day)_"
 
         status_line = ""
         if item["status"] in ("approved", "edited"):
@@ -1025,13 +1055,13 @@ def _handle_interaction(payload):
 
 
 def build_receipt_table(results: list) -> str:
-    headers = ["TICKET", "HOURS", "STATUS", "WHAT"]
+    headers = ["TICKET", "HOURS", "TIME", "CONF", "STATUS", "WHAT"]
     rows = []
     for r in results:
         status = "Logged" if r["ok"] is True else ("Failed" if r["ok"] is False else "No ticket")
-        what = r["description"][:36] + ("…" if len(r["description"]) > 36 else "")
-        rows.append([r["key"], f"{r['hours']}h", status, what])
-    widths = [max(len(headers[i]), *(len(row[i]) for row in rows)) for i in range(4)]
+        what = r["description"][:28] + ("…" if len(r["description"]) > 28 else "")
+        rows.append([r["key"], f"{r['hours']}h", r["time"], f"{r['confidence']:.0f}%", status, what])
+    widths = [max(len(headers[i]), *(len(row[i]) for row in rows)) for i in range(6)]
     fmt_row = lambda row: "  ".join(cell.ljust(w) for cell, w in zip(row, widths))
     lines = [fmt_row(headers), "  ".join("-" * w for w in widths)] + [fmt_row(r) for r in rows]
     return "```\n" + "\n".join(lines) + "\n```"
@@ -1047,6 +1077,8 @@ def submit_to_jira(draft):
             # until it's edited to add one, so treat it as resolved for now
             results.append({"key": item["ticket_key"] or item["ticket_summary"],
                              "description": item["description"], "hours": item["hours"],
+                             "confidence": item["confidence"],
+                             "time": f"{item['start_time']}-{item['end_time']}",
                              "ok": None, "err": None})
             item["synced"] = True
             continue
@@ -1064,7 +1096,9 @@ def submit_to_jira(draft):
             item["jira_worklog_id"] = worklog_id
             item["synced"] = True
         results.append({"key": item["ticket_key"], "description": item["description"],
-                         "hours": item["hours"], "ok": ok, "err": err})
+                         "hours": item["hours"], "confidence": item["confidence"],
+                         "time": f"{item['start_time']}-{item['end_time']}",
+                         "ok": ok, "err": err})
 
     logged_now = sum(r["hours"] for r in results if r["ok"] is True)
     count = len(results)
