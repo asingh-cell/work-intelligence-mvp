@@ -615,14 +615,45 @@ def nearest_time_slot(hhmm: str) -> str:
     return f"{snapped // 60:02d}:{snapped % 60:02d}"
 
 
-def time_select_block(block_id: str, label: str, current_value: str) -> dict:
+def time_select_block(block_id: str, label: str, current_value: str, action_id: str = "value") -> dict:
     options = [{"text": {"type": "plain_text", "text": lbl}, "value": val} for val, lbl in TIME_OPTIONS]
     initial = next(o for o in options if o["value"] == nearest_time_slot(current_value))
     return {
         "type": "input", "block_id": block_id,
         "label": {"type": "plain_text", "text": label},
-        "element": {"type": "static_select", "action_id": "value", "options": options, "initial_option": initial},
+        "element": {"type": "static_select", "action_id": action_id, "options": options, "initial_option": initial},
     }
+
+
+def custom_time_input_block(block_id: str) -> dict:
+    """Fallback for anyone who'd rather type an exact time than scroll a
+    15-minute-increment dropdown. Optional — leave blank to use the dropdown."""
+    return {
+        "type": "input", "block_id": block_id, "optional": True,
+        "label": {"type": "plain_text", "text": "Or type a time (e.g. 2:15 PM, or 14:15)"},
+        "element": {"type": "plain_text_input", "action_id": "value"},
+    }
+
+
+def parse_custom_time(text: str) -> str | None:
+    """'2:15 PM' / '2:15pm' / '9am' / '14:15' -> '14:15'. None if unparseable
+    or blank, so callers can cleanly fall back to the dropdown value."""
+    if not text or not text.strip():
+        return None
+    t = text.strip().upper().replace(" ", "")
+    m = re.match(r"^(\d{1,2}):?(\d{2})?(AM|PM)?$", t)
+    if not m:
+        return None
+    h = int(m.group(1))
+    minute = int(m.group(2) or 0)
+    suffix = m.group(3)
+    if suffix:
+        h = h % 12
+        if suffix == "PM":
+            h += 12
+    if not (0 <= h <= 23 and 0 <= minute <= 59):
+        return None
+    return f"{h:02d}:{minute:02d}"
 
 
 def ticket_dropdown_block(ticket_options: list, initial_key: str = None) -> dict:
@@ -647,21 +678,26 @@ def ticket_dropdown_block(ticket_options: list, initial_key: str = None) -> dict
     return block
 
 
-def edit_modal(draft_id, item_id, item, ticket_options=None):
+def edit_modal(draft_id, item_id, item, ticket_options=None, overrides=None):
+    v = {**item, **(overrides or {})}
     blocks = [
-        ticket_dropdown_block(ticket_options, initial_key=item["ticket_key"]),
+        ticket_dropdown_block(ticket_options, initial_key=v["ticket_key"]),
         {"type": "input", "block_id": "title", "label": {"type": "plain_text", "text": "Title"},
-         "element": {"type": "plain_text_input", "action_id": "value", "initial_value": item["ticket_summary"]}},
+         "element": {"type": "plain_text_input", "action_id": "value", "initial_value": v["ticket_summary"]}},
         {"type": "input", "block_id": "description", "label": {"type": "plain_text", "text": "Description"},
          "element": {"type": "plain_text_input", "action_id": "value", "multiline": True,
-                     "initial_value": item["description"]}},
+                     "initial_value": v["description"]}},
         {"type": "input", "block_id": "hours", "label": {"type": "plain_text", "text": "Hours"},
-         "element": {"type": "plain_text_input", "action_id": "value", "initial_value": str(item["hours"])}},
-        time_select_block("start_time", "Start", item["start_time"]),
-        time_select_block("end_time", "End", item["end_time"]),
+         "element": {"type": "number_input", "action_id": "live_hours", "is_decimal_allowed": True,
+                     "initial_value": str(v["hours"]),
+                     "dispatch_action_config": {"trigger_actions_on": ["on_enter_pressed"]}}},
+        time_select_block("start_time", "Start", v["start_time"], action_id="live_start_time"),
+        custom_time_input_block("start_time_custom"),
+        time_select_block("end_time", "End (auto-updates from Start + Hours, or set it yourself)", v["end_time"]),
+        custom_time_input_block("end_time_custom"),
         {"type": "input", "block_id": "timezone", "label": {"type": "plain_text", "text": "Timezone"},
          "element": {"type": "static_select", "action_id": "value",
-                     "initial_option": {"text": {"type": "plain_text", "text": item["timezone"]}, "value": item["timezone"]},
+                     "initial_option": {"text": {"type": "plain_text", "text": v["timezone"]}, "value": v["timezone"]},
                      "options": [{"text": {"type": "plain_text", "text": tz}, "value": tz} for tz in TIMEZONES]}},
     ]
     return {
@@ -697,6 +733,7 @@ def manual_modal(draft_id, category_key, category_label, ticket_options=None):
         {"type": "input", "block_id": "description", "label": {"type": "plain_text", "text": "What did you do?"},
          "element": {"type": "plain_text_input", "action_id": "value", "multiline": True}},
         time_select_block("start_time", "Start time", "09:00"),
+        custom_time_input_block("start_time_custom"),
         {"type": "input", "block_id": "hours", "label": {"type": "plain_text", "text": "How many hours?"},
          "element": {"type": "plain_text_input", "action_id": "value"}},
         {"type": "input", "block_id": "timezone", "label": {"type": "plain_text", "text": "Timezone"},
@@ -883,6 +920,30 @@ def _handle_interaction(payload):
                       view=manual_modal(draft_id, key, label,
                                         ticket_options=draft.get("ticket_options") if draft else None))
 
+        elif action_id in ("live_start_time", "live_hours"):
+            draft_id, item_id = payload["view"]["private_metadata"].split("|")
+            draft = PENDING.get(draft_id)
+            if draft:
+                v = payload["view"]["state"]["values"]
+                current_start = v["start_time"]["value"]["selected_option"]["value"]
+                try:
+                    current_hours = float(v["hours"]["value"]["value"] or 0)
+                except (TypeError, ValueError):
+                    current_hours = 0.0
+                overrides = {
+                    "ticket_key": v["ticket_key"]["value"]["selected_option"]["value"],
+                    "ticket_summary": v["title"]["value"]["value"],
+                    "description": v["description"]["value"]["value"],
+                    "hours": current_hours,
+                    "start_time": current_start,
+                    "end_time": add_hours_to_time(current_start, current_hours),
+                    "timezone": v["timezone"]["value"]["selected_option"]["value"],
+                }
+                new_view = edit_modal(draft_id, item_id, draft["items"][item_id],
+                                       ticket_options=draft.get("ticket_options"), overrides=overrides)
+                slack_api("views.update", view_id=payload["view"]["id"],
+                          hash=payload["view"]["hash"], view=new_view)
+
         elif action_id == "submit_final":
             draft_id = action["value"]
             draft = PENDING.get(draft_id)
@@ -911,9 +972,11 @@ def _handle_interaction(payload):
                 item["ticket_key"] = "UNMATCHED" if selected == NO_TICKET_SENTINEL else selected
                 item["ticket_summary"] = values["title"]["value"]["value"]
                 item["description"] = values["description"]["value"]["value"]
-                item["hours"] = float(values["hours"]["value"]["value"] or 0)
-                item["start_time"] = values["start_time"]["value"]["selected_option"]["value"]
-                item["end_time"] = values["end_time"]["value"]["selected_option"]["value"]
+                item["hours"] = float(values["hours"]["live_hours"]["value"] or 0)
+                custom_start = parse_custom_time(values.get("start_time_custom", {}).get("value", {}).get("value"))
+                custom_end = parse_custom_time(values.get("end_time_custom", {}).get("value", {}).get("value"))
+                item["start_time"] = custom_start or values["start_time"]["value"]["selected_option"]["value"]
+                item["end_time"] = custom_end or values["end_time"]["value"]["selected_option"]["value"]
                 item["timezone"] = values["timezone"]["value"]["selected_option"]["value"]
                 item["status"] = "edited"
                 item["synced"] = False
@@ -926,7 +989,8 @@ def _handle_interaction(payload):
                 selected = values["ticket_key"]["value"]["selected_option"]["value"]
                 ticket_key = "N/A" if selected == NO_TICKET_SENTINEL else selected
                 hours = float(values["hours"]["value"]["value"] or 0)
-                start_time = values["start_time"]["value"]["selected_option"]["value"]
+                custom_start = parse_custom_time(values.get("start_time_custom", {}).get("value", {}).get("value"))
+                start_time = custom_start or values["start_time"]["value"]["selected_option"]["value"]
                 item_id = new_item_id()
                 draft["items"][item_id] = {
                     "ticket_key": ticket_key,
