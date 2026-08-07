@@ -93,6 +93,7 @@ def test_evidence_marker_filters_untagged_messages():
     untagged = "just chatting about lunch plans"
     assert marker in tagged.lower()
     assert marker not in untagged.lower()
+    assert not marker.startswith(("@", "#"))  # must never risk Slack's own mention/channel autocomplete
 
 
 if __name__ == "__main__":

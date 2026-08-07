@@ -65,10 +65,13 @@ except json.JSONDecodeError:
 AUTO_WRITE_THRESHOLD = float(os.environ.get("AUTO_WRITE_THRESHOLD", "70"))
 
 # Only messages containing this marker get pulled into the pipeline at all —
-# everything else in the channel is invisible to this app. Off by default
-# behavior would be "read everything"; requiring an explicit tag is the
-# safer default for channels that carry sensitive context.
-EVIDENCE_MARKER = os.environ.get("EVIDENCE_MARKER", "@jira").lower()
+# everything else in the channel is invisible to this app. Deliberately not
+# "@jira" or anything starting with @ or # — those are Slack's own trigger
+# characters for mentions/channels, and a real installed Jira (or other) app
+# in the workspace can hijack it into a resolved mention token instead of
+# plain text if someone clicks the autocomplete suggestion, silently
+# breaking the filter. A plain bracketed tag has no special meaning to Slack.
+EVIDENCE_MARKER = os.environ.get("EVIDENCE_MARKER", "[log]").lower()
 
 DAILY_TARGET_HOURS = 8.0
 

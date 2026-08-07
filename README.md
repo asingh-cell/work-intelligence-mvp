@@ -57,13 +57,19 @@ HTTPS URL for interactivity, so:
 **6. `ALLOWED_TICKET_KEYS`.** Must be real keys that exist in your Jira
    project — pick 2-3 you'll actually reference in the test Slack messages.
 
-**6b. `EVIDENCE_MARKER` (default `@jira`).** Only messages containing this
+**6b. `EVIDENCE_MARKER` (default `[log]`).** Only messages containing this
    marker get pulled into the pipeline — everything else in the channel is
    invisible to this app. This keeps sensitive channel chatter out of
    Claude entirely: nobody has to trust the model to ignore the wrong
    things, it never sees them. To log something, just include the marker
-   anywhere in the message, e.g. *"Fixed the auth bug today @jira, took
-   about 2 hours."* Change the env var if you'd rather use a different tag.
+   anywhere in the message, e.g. *"Fixed the auth bug today [log], took
+   about 2 hours."* Change the env var if you'd rather use a different tag
+   — but avoid anything starting with `@` or `#`. Those are Slack's own
+   trigger characters for mentions and channels, and if a real app in your
+   workspace happens to share that name (e.g. an installed Jira or Fireflies
+   integration), Slack's autocomplete can turn what looks like plain text
+   into a resolved mention token the moment someone clicks the suggestion —
+   which would silently break the filter for that message.
 
 **7. Anthropic API key** for `ANTHROPIC_API_KEY`. Default model is
    `claude-sonnet-5`.
